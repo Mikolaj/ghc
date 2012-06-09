@@ -574,6 +574,51 @@ void traceSparkCounters_ (Capability *cap,
     }
 }
 
+#if defined(THREADED_RTS)
+void traceTaskCreate_ (OSThreadId taskID,
+                       Capability *cap,
+                       pid_t tid)
+{
+#ifdef DEBUG
+    if (RtsFlags.TraceFlags.tracing == TRACE_STDERR) {
+        /* We currently don't do debug tracing of tasks but we must
+           test for TRACE_STDERR because of the !eventlog_enabled case. */
+    } else
+#endif
+    {
+        postTaskCreateEvent(taskID, cap, tid);
+    }
+}
+
+void traceTaskMigrate_ (OSThreadId taskID,
+                        Capability *cap,
+                        Capability *new_cap)
+{
+#ifdef DEBUG
+    if (RtsFlags.TraceFlags.tracing == TRACE_STDERR) {
+        /* We currently don't do debug tracing of tasks but we must
+           test for TRACE_STDERR because of the !eventlog_enabled case. */
+    } else
+#endif
+    {
+        postTaskMigrateEvent(taskID, cap, new_cap);
+    }
+}
+
+void traceTaskDelete_ (OSThreadId taskID)
+{
+#ifdef DEBUG
+    if (RtsFlags.TraceFlags.tracing == TRACE_STDERR) {
+        /* We currently don't do debug tracing of tasks but we must
+           test for TRACE_STDERR because of the !eventlog_enabled case. */
+    } else
+#endif
+    {
+        postTaskDeleteEvent(taskID);
+    }
+}
+#endif /* defined(THREADED_RTS) */
+
 #ifdef DEBUG
 static void traceCap_stderr(Capability *cap, char *msg, va_list ap)
 {

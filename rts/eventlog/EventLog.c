@@ -102,6 +102,9 @@ char *EventDesc[] = {
   [EVENT_SPARK_STEAL]         = "Spark steal",
   [EVENT_SPARK_FIZZLE]        = "Spark fizzle",
   [EVENT_SPARK_GC]            = "Spark GC",
+  [EVENT_TASK_CREATE]         = "Task create",
+  [EVENT_TASK_MIGRATE]        = "Task migrate",
+  [EVENT_TASK_DELETE]         = "Task delete",
 };
 
 // Event type.
@@ -121,6 +124,10 @@ static void printAndClearEventBuf (EventsBuf *eventsBuf);
 static void postEventType(EventsBuf *eb, EventType *et);
 
 static void postLogMsg(EventsBuf *eb, EventTypeNum type, char *msg, va_list ap);
+
+#if defined(THREADED_RTS)
+static void postOSThreadId(EventsBuf *eb, OSThreadId threadID);
+#endif /* defined(THREADED_RTS) */
 
 static void postBlockMarker(EventsBuf *eb);
 static void closeBlockMarker(EventsBuf *ebuf);
@@ -198,6 +205,22 @@ static inline void postInt32(EventsBuf *eb, StgInt32 i)
 
 static inline void postInt64(EventsBuf *eb, StgInt64 i)
 { postWord64(eb, (StgWord64)i); }
+
+#if defined(THREADED_RTS)
+static inline void postPID(EventsBuf *eb, pid_t pid)
+/* OS process and thread id seems to be 32 bits on all our supported platforms.
+   We encode it as Word32 (even though it's a signed int on Linux). */
+{ postWord32(eb, pid); }
+
+void postOSThreadId(EventsBuf *eb, OSThreadId threadID)
+{
+    nat size = sizeof(threadID);
+
+    /* We assume the check for enough room in eb is performed elsewhere. */
+    postPayloadSize(eb, size);
+    postBuf(eb,(StgWord8*) &threadID,size);
+}
+#endif /* defined(THREADED_RTS) */
 
 
 void
@@ -392,6 +415,22 @@ initEventLogging(void)
                                + sizeof(StgWord32)
                                + sizeof(StgWord64) * 2;
             break;
+
+#if defined(THREADED_RTS)
+        case EVENT_TASK_CREATE:   // (taskID, cap, tid)
+            eventTypes[t].size =
+                sizeof(OSThreadId) + sizeof(EventCapNo) + sizeof(StgWord32);
+            break;
+
+        case EVENT_TASK_MIGRATE:   // (taskID, cap, new_cap)
+            eventTypes[t].size =
+                sizeof(OSThreadId) + sizeof(EventCapNo) + sizeof(EventCapNo);
+            break;
+
+        case EVENT_TASK_DELETE:   // (taskID)
+            eventTypes[t].size = sizeof(OSThreadId);
+            break;
+#endif /* defined(THREADED_RTS) */
 
         case EVENT_BLOCK_MARKER:
             eventTypes[t].size = sizeof(StgWord32) + sizeof(EventTimestamp) +
@@ -699,7 +738,7 @@ void postCapsetEvent (EventTypeNum tag,
     case EVENT_OSPROCESS_PID:   // (capset, pid)
     case EVENT_OSPROCESS_PPID:  // (capset, parent_pid)
     {
-        postWord32(&eventBuf, info);
+        postPID(&eventBuf, info);
         break;
     }
     default:
@@ -913,6 +952,61 @@ void postEventGcStats  (Capability    *cap,
     postWord64(eb, par_max_copied);
     postWord64(eb, par_tot_copied);
 }
+
+#if defined(THREADED_RTS)
+void postTaskCreateEvent (OSThreadId taskID,
+                          Capability *cap,
+                          pid_t tid)
+{
+    ACQUIRE_LOCK(&eventBufMutex);
+
+    if (!hasRoomForEvent(&eventBuf, EVENT_TASK_CREATE)) {
+        // Flush event buffer to make room for new event.
+        printAndClearEventBuf(&eventBuf);
+    }
+
+    postEventHeader(&eventBuf, EVENT_TASK_CREATE);
+    postOSThreadId(&eventBuf, taskID);
+    postCapNo(&eventBuf, cap->no);
+    postPID(&eventBuf, tid);
+
+    RELEASE_LOCK(&eventBufMutex);
+}
+
+void postTaskMigrateEvent (OSThreadId taskID,
+                           Capability *cap,
+                           Capability *new_cap)
+{
+    ACQUIRE_LOCK(&eventBufMutex);
+
+    if (!hasRoomForEvent(&eventBuf, EVENT_TASK_MIGRATE)) {
+        // Flush event buffer to make room for new event.
+        printAndClearEventBuf(&eventBuf);
+    }
+
+    postEventHeader(&eventBuf, EVENT_TASK_MIGRATE);
+    postOSThreadId(&eventBuf, taskID);
+    postCapNo(&eventBuf, cap->no);
+    postCapNo(&eventBuf, new_cap->no);
+
+    RELEASE_LOCK(&eventBufMutex);
+}
+
+void postTaskDeleteEvent (OSThreadId taskID)
+{
+    ACQUIRE_LOCK(&eventBufMutex);
+
+    if (!hasRoomForEvent(&eventBuf, EVENT_TASK_DELETE)) {
+        // Flush event buffer to make room for new event.
+        printAndClearEventBuf(&eventBuf);
+    }
+
+    postEventHeader(&eventBuf, EVENT_TASK_DELETE);
+    postOSThreadId(&eventBuf, taskID);
+
+    RELEASE_LOCK(&eventBufMutex);
+}
+#endif /* defined(THREADED_RTS) */
 
 void
 postEvent (Capability *cap, EventTypeNum tag)

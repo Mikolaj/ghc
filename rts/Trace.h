@@ -16,6 +16,16 @@
 #include "RtsProbes.h"
 #endif /* defined(DTRACE) */
 
+#if defined(THREADED_RTS) && defined(linux_TARGET_OS)
+#ifdef HAVE_UNISTD_H
+#include <unistd.h>
+#endif
+#ifdef HAVE_SYS_TYPES_H
+#include <sys/types.h>
+#endif
+#include <syscall.h>
+#endif /* defined(THREADED_RTS) && defined(linux_TARGET_OS) */
+
 #include "BeginPrivate.h"
 
 // -----------------------------------------------------------------------------
@@ -262,6 +272,18 @@ void traceSparkCounters_ (Capability *cap,
                           SparkCounters counters,
                           StgWord remaining);
 
+#if defined(THREADED_RTS)
+void traceTaskCreate_ (OSThreadId taskID,
+                       Capability *cap,
+                       pid_t tid);
+
+void traceTaskMigrate_ (OSThreadId taskID,
+                        Capability *cap,
+                        Capability *new_cap);
+
+void traceTaskDelete_ (OSThreadId taskID);
+#endif  /* defined(THREADED_RTS) */
+
 #else /* !TRACING */
 
 #define traceSchedEvent(cap, tag, tso, other) /* nothing */
@@ -289,6 +311,9 @@ INLINE_HEADER void traceEventStartup_ (int n_caps STG_UNUSED) {};
 #define traceWallClockTime_() /* nothing */
 #define traceOSProcessInfo_() /* nothing */
 #define traceSparkCounters_(cap, counters, remaining) /* nothing */
+#define traceTaskCreate_(taskID, cap, tid) /* nothing */
+#define traceTaskMigrate_(taskID, cap, new_cap) /* nothing */
+#define traceTaskDelete_(taskID) /* nothing */
 
 #endif /* TRACING */
 
@@ -399,9 +424,9 @@ INLINE_HEADER void dtraceStartup (int num_caps) {
     HASKELLEVENT_CAPSET_ASSIGN_CAP(capset, capno)
 #define dtraceCapsetRemoveCap(capset, capno)            \
     HASKELLEVENT_CAPSET_REMOVE_CAP(capset, capno)
-#define dtraceSparkCounters(cap, a, b, c, d, e, f, g) \
+#define dtraceSparkCounters(cap, a, b, c, d, e, f, g)   \
     HASKELLEVENT_SPARK_COUNTERS(cap, a, b, c, d, e, f, g)
-#define dtraceSparkCreate(cap)                         \
+#define dtraceSparkCreate(cap)                          \
     HASKELLEVENT_SPARK_CREATE(cap)
 #define dtraceSparkDud(cap)                             \
     HASKELLEVENT_SPARK_DUD(cap)
@@ -415,6 +440,12 @@ INLINE_HEADER void dtraceStartup (int num_caps) {
     HASKELLEVENT_SPARK_FIZZLE(cap)
 #define dtraceSparkGc(cap)                              \
     HASKELLEVENT_SPARK_GC(cap)
+#define dtraceTaskCreate(taskID, cap, tid)              \
+    HASKELLEVENT_TASK_CREATE(taskID, cap, tid)
+#define dtraceTaskMigrate(taskID, cap, new_cap)         \
+    HASKELLEVENT_TASK_MIGRATE(taskID, cap, new_cap)
+#define dtraceTaskDelete(taskID)                        \
+    HASKELLEVENT_TASK_DELETE(taskID)
 
 #else /* !defined(DTRACE) */
 
@@ -464,6 +495,9 @@ INLINE_HEADER void dtraceStartup (int num_caps STG_UNUSED) {};
 #define dtraceSparkSteal(cap, victim_cap)               /* nothing */
 #define dtraceSparkFizzle(cap)                          /* nothing */
 #define dtraceSparkGc(cap)                              /* nothing */
+#define dtraceTaskCreate(taskID, cap, tid)              /* nothing */
+#define dtraceTaskMigrate(taskID, cap, new_cap)         /* nothing */
+#define dtraceTaskDelete(taskID)                        /* nothing */
 
 #endif
 
@@ -821,6 +855,43 @@ INLINE_HEADER void traceEventSparkGC(Capability *cap STG_UNUSED)
     traceSparkEvent(cap, EVENT_SPARK_GC);
     dtraceSparkGc((EventCapNo)cap->no);
 }
+
+#if defined(THREADED_RTS)
+INLINE_HEADER void traceTaskCreateOrMigrate(OSThreadId taskID   STG_UNUSED,
+                                            Capability *cap     STG_UNUSED,
+                                            Capability *new_cap STG_UNUSED)
+{
+    if (cap == NULL) {
+// Kernel thread id is Linux-specific, so for other architectures
+// another thread identifier should be used.
+#if defined(linux_TARGET_OS)
+        // A new bound task gets associated with a cap. We also record
+        // the kernel thread id of the task, which never changes.
+        pid_t tid = syscall(SYS_gettid);
+        if (RTS_UNLIKELY(TRACE_sched)) {
+            traceTaskCreate_(taskID, cap, tid);
+        }
+        dtraceTaskCreate(taskID, cap, tid);
+#endif /* defined(linux_TARGET_OS) */
+    } else if (cap != new_cap) {
+        // A task migrates from a cap to another.
+        if (RTS_UNLIKELY(TRACE_sched)) {
+            traceTaskMigrate_(taskID, cap, new_cap);
+        }
+        dtraceTaskMigrate(taskID, cap, new_cap);
+    }
+}
+#endif /* defined(THREADED_RTS) */
+
+#if defined(THREADED_RTS)
+INLINE_HEADER void traceTaskDelete(OSThreadId taskID STG_UNUSED)
+{
+    if (RTS_UNLIKELY(TRACE_sched)) {
+        traceTaskDelete_(taskID);
+    }
+    dtraceTaskDelete(taskID);
+}
+#endif /* defined(THREADED_RTS) */
 
 #include "EndPrivate.h"
 

@@ -90,6 +90,11 @@ provider HaskellEvent {
   probe spark__fizzle   (EventCapNo);
   probe spark__gc       (EventCapNo);
 
+  /* task events */
+  probe task__create(OSThreadId, EventCapNo, pid_t);
+  probe task__migrate(OSThreadId, EventCapNo, EventCapNo);
+  probe task__delete(OSThreadId);
+
   /* other events */
 /* This one doesn't seem to be used at all at the moment: */
 /*  probe log__msg (char *); */

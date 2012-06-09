@@ -3,16 +3,16 @@
  * (c) The GHC Team, 2008-2009
  *
  * Event log format
- * 
+ *
  * The log format is designed to be extensible: old tools should be
  * able to parse (but not necessarily understand all of) new versions
  * of the format, and new tools will be able to understand old log
  * files.
- * 
+ *
  * Each event has a specific format.  If you add new events, give them
  * new numbers: we never re-use old event numbers.
  *
- * - The format is endian-independent: all values are represented in 
+ * - The format is endian-independent: all values are represented in
  *    bigendian order.
  *
  * - The format is extensible:
@@ -51,7 +51,7 @@
  *       Word8*         -- extra info (for future extensions)
  *       EVENT_ET_END
  *
- * Event : 
+ * Event :
  *       Word16         -- event_type
  *       Word64         -- time (nanosecs)
  *       [Word16]       -- length of the rest (for variable-sized events only)
@@ -158,21 +158,26 @@
                                          par_n_threads,
                                          par_max_copied, par_tot_copied) */
 #define EVENT_GC_GLOBAL_SYNC      54 /* ()                     */
+#define EVENT_TASK_CREATE         55 /* (taskID, cap, tid)       */
+#define EVENT_TASK_MIGRATE        56 /* (taskID, cap, new_cap)   */
+#define EVENT_TASK_DELETE         57 /* (taskID)                 */
 
-/* Range 55 - 59 is available for new GHC and common events */
+/* Range 58 - 59 is available for new GHC and common events. */
 
 /* Range 60 - 80 is used by eden for parallel tracing
  * see http://www.mathematik.uni-marburg.de/~eden/
  */
 
-/* Range 100 - 139 is reserved for Mercury */
+/* Range 100 - 139 is reserved for Mercury. */
+
+/* Range 140 - 159 is reserved for Perf events. */
 
 /*
  * The highest event code +1 that ghc itself emits. Note that some event
  * ranges higher than this are reserved but not currently emitted by ghc.
  * This must match the size of the EventDesc[] array in EventLog.c
  */
-#define NUM_GHC_EVENT_TAGS        55
+#define NUM_GHC_EVENT_TAGS        58
 
 #if 0  /* DEPRECATED EVENTS: */
 /* we don't actually need to record the thread, it's implicit */
