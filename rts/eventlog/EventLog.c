@@ -104,7 +104,7 @@ char *EventDesc[] = {
   [EVENT_SPARK_GC]            = "Spark GC",
 };
 
-// Event type. 
+// Event type.
 
 typedef struct _EventType {
   EventTypeNum etNum;  // Event Type number.
@@ -130,7 +130,7 @@ static StgBool hasRoomForVariableEvent(EventsBuf *eb, nat payload_bytes);
 
 static inline void postWord8(EventsBuf *eb, StgWord8 i)
 {
-    *(eb->pos++) = i; 
+    *(eb->pos++) = i;
 }
 
 static inline void postWord16(EventsBuf *eb, StgWord16 i)
@@ -185,7 +185,7 @@ static inline void postEventHeader(EventsBuf *eb, EventTypeNum type)
 {
     postEventTypeNum(eb, type);
     postTimestamp(eb);
-}    
+}
 
 static inline void postInt8(EventsBuf *eb, StgInt8 i)
 { postWord8(eb, (StgWord8)i); }
@@ -247,17 +247,17 @@ initEventLogging(void)
     /* Open event log file for writing. */
     if ((event_log_file = fopen(event_log_filename, "wb")) == NULL) {
         sysErrorBelch("initEventLogging: can't open %s", event_log_filename);
-        stg_exit(EXIT_FAILURE);    
+        stg_exit(EXIT_FAILURE);
     }
 
-    /* 
+    /*
      * Allocate buffer(s) to store events.
      * Create buffer large enough for the header begin marker, all event
      * types, and header end marker to prevent checking if buffer has room
      * for each of these steps, and remove the need to flush the buffer to
      * disk during initialization.
      *
-     * Use a single buffer to store the header with event types, then flush 
+     * Use a single buffer to store the header with event types, then flush
      * the buffer so all buffers are empty for writing events.
      */
 #ifdef THREADED_RTS
@@ -394,7 +394,7 @@ initEventLogging(void)
             break;
 
         case EVENT_BLOCK_MARKER:
-            eventTypes[t].size = sizeof(StgWord32) + sizeof(EventTimestamp) + 
+            eventTypes[t].size = sizeof(StgWord32) + sizeof(EventTimestamp) +
                 sizeof(EventCapNo);
             break;
 
@@ -408,10 +408,10 @@ initEventLogging(void)
 
     // Mark end of event types in the header.
     postInt32(&eventBuf, EVENT_HET_END);
-    
+
     // Write in buffer: the header end marker.
     postInt32(&eventBuf, EVENT_HEADER_END);
-    
+
     // Prepare event buffer for events (data).
     postInt32(&eventBuf, EVENT_DATA_BEGIN);
 
@@ -477,10 +477,10 @@ void
 freeEventLogging(void)
 {
     StgWord8 c;
-    
+
     // Free events buffer.
     for (c = 0; c < n_capabilities; ++c) {
-        if (capEventBuf[c].begin != NULL) 
+        if (capEventBuf[c].begin != NULL)
             stgFree(capEventBuf[c].begin);
     }
     if (capEventBuf != NULL)  {
@@ -491,7 +491,7 @@ freeEventLogging(void)
     }
 }
 
-void 
+void
 flushEventLog(void)
 {
     if (event_log_file != NULL) {
@@ -499,7 +499,7 @@ flushEventLog(void)
     }
 }
 
-void 
+void
 abortEventLogging(void)
 {
     freeEventLogging();
@@ -512,9 +512,9 @@ abortEventLogging(void)
  * If the buffer is full, prints out the buffer and clears it.
  */
 void
-postSchedEvent (Capability *cap, 
-                EventTypeNum tag, 
-                StgThreadID thread, 
+postSchedEvent (Capability *cap,
+                EventTypeNum tag,
+                StgThreadID thread,
                 StgWord info1,
                 StgWord info2)
 {
@@ -526,7 +526,7 @@ postSchedEvent (Capability *cap,
         // Flush event buffer to make room for new event.
         printAndClearEventBuf(eb);
     }
-    
+
     postEventHeader(eb, tag);
 
     switch (tag) {
@@ -610,7 +610,7 @@ postSparkEvent (Capability *cap,
 }
 
 void
-postSparkCountersEvent (Capability *cap, 
+postSparkCountersEvent (Capability *cap,
                         SparkCounters counters,
                         StgWord remaining)
 {
@@ -622,7 +622,7 @@ postSparkCountersEvent (Capability *cap,
         // Flush event buffer to make room for new event.
         printAndClearEventBuf(eb);
     }
-    
+
     postEventHeader(eb, EVENT_SPARK_COUNTERS);
     /* EVENT_SPARK_COUNTERS (crt,dud,ovf,cnv,gcd,fiz,rem) */
     postWord64(eb,counters.created);
@@ -644,7 +644,7 @@ postCapEvent (EventTypeNum  tag,
         // Flush event buffer to make room for new event.
         printAndClearEventBuf(&eventBuf);
     }
-    
+
     postEventHeader(&eventBuf, tag);
 
     switch (tag) {
@@ -780,7 +780,7 @@ void postWallClockTime (EventCapsetID capset)
     StgWord32 nsec;
 
     ACQUIRE_LOCK(&eventBufMutex);
-    
+
     /* The EVENT_WALL_CLOCK_TIME event is intended to allow programs
        reading the eventlog to match up the event timestamps with wall
        clock time. The normal event timestamps measure time since the
@@ -796,7 +796,7 @@ void postWallClockTime (EventCapsetID capset)
        the elapsed time vs the wall clock time. So to minimise the
        difference we just call them very close together.
      */
-    
+
     getUnixEpochTime(&sec, &nsec);  /* Get the wall clock time */
     ts = time_ns();                 /* Get the eventlog timestamp */
 
@@ -810,7 +810,7 @@ void postWallClockTime (EventCapsetID capset)
        timestamp we already generated above. */
     postEventTypeNum(&eventBuf, EVENT_WALL_CLOCK_TIME);
     postWord64(&eventBuf, ts);
-    
+
     /* EVENT_WALL_CLOCK_TIME (capset, unix_epoch_seconds, nanoseconds) */
     postCapsetID(&eventBuf, capset);
     postWord64(&eventBuf, sec);
@@ -835,7 +835,7 @@ void postHeapEvent (Capability    *cap,
         // Flush event buffer to make room for new event.
         printAndClearEventBuf(eb);
     }
-    
+
     postEventHeader(eb, tag);
 
     switch (tag) {
@@ -899,7 +899,7 @@ void postEventGcStats  (Capability    *cap,
         // Flush event buffer to make room for new event.
         printAndClearEventBuf(eb);
     }
-    
+
     postEventHeader(eb, EVENT_GC_STATS_GHC);
     /* EVENT_GC_STATS_GHC (heap_capset, generation,
                            copied_bytes, slop_bytes, frag_bytes,
@@ -986,7 +986,7 @@ void postCapMsg(Capability *cap, char *msg, va_list ap)
 void postUserMsg(Capability *cap, char *msg, va_list ap)
 {
     postLogMsg(&capEventBuf[cap->no], EVENT_USER_MSG, msg, ap);
-}    
+}
 
 void postEventStartup(EventCapNo n_caps)
 {
@@ -1072,7 +1072,7 @@ void printAndClearEventBuf (EventsBuf *ebuf)
     if (ebuf->begin != NULL && ebuf->pos != ebuf->begin)
     {
         numBytes = ebuf->pos - ebuf->begin;
-        
+
         written = fwrite(ebuf->begin, 1, numBytes, event_log_file);
         if (written != numBytes) {
             debugBelch(
@@ -1080,7 +1080,7 @@ void printAndClearEventBuf (EventsBuf *ebuf)
                 " doesn't match numBytes=%" FMT_Word64, written, numBytes);
             return;
         }
-        
+
         resetEventsBuf(ebuf);
         flushCount++;
 
@@ -1127,7 +1127,7 @@ StgBool hasRoomForVariableEvent(EventsBuf *eb, nat payload_bytes)
   } else  {
       return 1; // Buf has enough space for the event.
   }
-}    
+}
 
 void postEventType(EventsBuf *eb, EventType *et)
 {
