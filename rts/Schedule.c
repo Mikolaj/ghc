@@ -790,7 +790,10 @@ schedulePushWork(Capability *cap USED_IF_THREADS,
 
                     traceEventMigrateThread (cap, t, free_caps[i]->no);
 
-                    if (t->bound) { t->bound->task->cap = free_caps[i]; }
+                    if (t->bound) {
+                        traceTaskCreateOrMigrate(t->bound->task->id, t->bound->task->cap, free_caps[i]);
+                        t->bound->task->cap = free_caps[i];
+                    }
                     t->cap = free_caps[i];
                     i++;
                 }
@@ -833,6 +836,7 @@ schedulePushWork(Capability *cap USED_IF_THREADS,
             releaseAndWakeupCapability(free_caps[i]);
         }
     }
+    traceTaskCreateOrMigrate(task->id, task->cap, cap);
     task->cap = cap; // reset to point to our Capability.
 
 #endif /* THREADED_RTS */
@@ -1413,6 +1417,7 @@ static void acquireAllCapabilities(Capability *cap, Task *task)
             }
         }
     }
+    traceTaskCreateOrMigrate(task->id, task->cap, cap);
     task->cap = cap;
 }
 
@@ -1426,6 +1431,7 @@ static void releaseAllCapabilities(Capability *cap, Task *task)
             releaseCapability(&capabilities[i]);
         }
     }
+    traceTaskCreateOrMigrate(task->id, task->cap, cap);
     task->cap = cap;
 }
 #endif
@@ -1623,7 +1629,10 @@ delete_threads_and_gc:
             while (!emptyRunQueue(tmp_cap)) {
                 tso = popRunQueue(tmp_cap);
                 migrateThread(tmp_cap, tso, dest_cap);
-                if (tso->bound) { tso->bound->task->cap = dest_cap; }
+                if (tso->bound) {
+                  traceTaskCreateOrMigrate(tso->bound->task->id, tso->bound->task->cap, dest_cap);
+                  tso->bound->task->cap = dest_cap;
+                }
             }
         }
     }
@@ -1684,6 +1693,7 @@ delete_threads_and_gc:
                 }
             }
         }
+        traceTaskCreateOrMigrate(task->id, task->cap, cap);
         task->cap = cap;
     }
 #endif
@@ -1875,6 +1885,9 @@ forkProcess(HsStablePtr *entry
             }
         }
         cap = &capabilities[0];
+#if defined(THREADED_RTS)
+        traceTaskCreateOrMigrate(task->id, task->cap, cap);
+#endif
         task->cap = cap;
 
         // Empty the threads lists.  Otherwise, the garbage
@@ -2218,6 +2231,10 @@ resumeThread (void *task_)
 
     incall = task->incall;
     cap = incall->suspended_cap;
+
+#if defined(THREADED_RTS)
+    traceTaskCreateOrMigrate(task->id, task->cap, cap);
+#endif
     task->cap = cap;
 
     // Wait for permission to re-enter the RTS with the result.

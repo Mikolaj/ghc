@@ -617,7 +617,8 @@ waitForReturnCapability (Capability **pCap, Task *task)
             }
         }
 
-        // record the Capability as the one this Task is now assocated with.
+        // Record the Capability as the one this Task is now associated with.
+        traceTaskCreateOrMigrate(task->id, task->cap, cap);
         task->cap = cap;
 
     } else {
@@ -821,6 +822,7 @@ tryGrabCapability (Capability *cap, Task *task)
         RELEASE_LOCK(&cap->lock);
         return rtsFalse;
     }
+    traceTaskCreateOrMigrate(task->id, task->cap, cap);
     task->cap = cap;
     cap->running_task = task;
     RELEASE_LOCK(&cap->lock);

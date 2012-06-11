@@ -131,8 +131,8 @@ void postTaskCreateEvent (OSThreadId taskID,
                           pid_t tid);
 
 void postTaskMigrateEvent (OSThreadId taskID,
-                        Capability *cap,
-                        Capability *new_cap);
+                           Capability *cap,
+                           Capability *new_cap);
 
 void postTaskDeleteEvent (OSThreadId taskID);
 #endif /* defined(THREADED_RTS) */
