@@ -574,6 +574,52 @@ void traceSparkCounters_ (Capability *cap,
     }
 }
 
+void traceTaskCreate_ (Task       *task,
+                       Capability *cap)
+{
+#ifdef DEBUG
+    if (RtsFlags.TraceFlags.tracing == TRACE_STDERR) {
+        /* We currently don't do debug tracing of tasks but we must
+           test for TRACE_STDERR because of the !eventlog_enabled case. */
+    } else
+#endif
+    {
+        EventTaskId         taskid = getTaskSerialisableId(task);
+        EventKernelThreadId tid    = osKernelThreadId();
+        postTaskCreateEvent(taskid, cap->no, tid);
+    }
+}
+
+void traceTaskMigrate_ (Task       *task,
+                        Capability *cap,
+                        Capability *new_cap)
+{
+#ifdef DEBUG
+    if (RtsFlags.TraceFlags.tracing == TRACE_STDERR) {
+        /* We currently don't do debug tracing of tasks but we must
+           test for TRACE_STDERR because of the !eventlog_enabled case. */
+    } else
+#endif
+    {
+        EventTaskId taskid = getTaskSerialisableId(task);
+        postTaskMigrateEvent(taskid, cap->no, new_cap->no);
+    }
+}
+
+void traceTaskDelete_ (Task *task)
+{
+#ifdef DEBUG
+    if (RtsFlags.TraceFlags.tracing == TRACE_STDERR) {
+        /* We currently don't do debug tracing of tasks but we must
+           test for TRACE_STDERR because of the !eventlog_enabled case. */
+    } else
+#endif
+    {
+        EventTaskId taskid = getTaskSerialisableId(task);
+        postTaskDeleteEvent(taskid);
+    }
+}
+
 #ifdef DEBUG
 static void traceCap_stderr(Capability *cap, char *msg, va_list ap)
 {
