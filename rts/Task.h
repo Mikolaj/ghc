@@ -275,6 +275,19 @@ setMyTask (Task *task)
 #endif
 }
 
+//
+// Get a serialisable Id for the Task's OS thread
+// Needed mainly for logging since the OSThreadId is an opaque type
+INLINE_HEADER StgWord64
+getTaskSerialisableId (Task *task STG_UNUSED)
+{
+#if defined(THREADED_RTS)
+    return getThreadSerialisableId(task->id);
+#else
+    return 1;
+#endif
+}
+
 #include "EndPrivate.h"
 
 #endif /* TASK_H */

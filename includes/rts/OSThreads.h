@@ -15,7 +15,7 @@
 #ifndef RTS_OSTHREADS_H
 #define RTS_OSTHREADS_H
 
-#if defined(THREADED_RTS) /* to the end */
+#if defined(THREADED_RTS) /* to near the end */
 
 #if defined(HAVE_PTHREAD_H) && !defined(mingw32_HOST_OS)
 
@@ -222,6 +222,51 @@ int forkOS_createThread ( HsStablePtr entry );
 // Returns the number of processor cores in the machine
 //
 nat getNumberOfProcessors (void);
+
+//
+// Get a unique serialisable representation for an OSThreadId.
+//
+// It's only unique within the process. For example if they are emitted in a
+// log file then it is suitable to work out which log entries are releated.
+//
+// This is needed because OSThreadId is an opaque type
+// and in practice on some platforms it is a pointer type.
+//
+#if defined(THREADED_RTS)
+INLINE_HEADER StgWord64 getThreadSerialisableId (OSThreadId tid) {
+#if defined(freebsd_HOST_OS) || defined(darwin_HOST_OS)
+    // Here OSThreadId is a pthread_t which is a pointer but within
+    // the process we can still use that pointer value as a unique id
+    return (StgWord64) tid
+#else
+    // On Windows, Linux and others it's an integral type to start with
+    return tid;
 #endif
+}
+#endif
+
+//
+// Support for getting at the kernel thread Id for tracing/profiling.
+//
+// This stuff is optional and only used for tracing/profiling purposes, to
+// match up thread ids recorded by other tools. For example, on Linux and OSX
+// the pthread_t type is not the same as the kernel thread id, and system
+// profiling tools like Linux perf, and OSX's DTrace use the kernel thread Id.
+// So if we want to match up RTS tasks with kernel threads recorded by these
+// tools then we need to know the kernel thread Id, and this must be a separate
+// type from the OSThreadId.
+//
+// If the feature cannot be supported on an OS, it is OK to always return 0.
+// In particular it would almost certaily be meaningless on systems not using
+// a 1:1 threading model.
+
+// We use a common serialisable representation on all OSs
+// This is ok for Windows, OSX and Linux.
+typedef StgWord64 OSKernelThreadId;
+
+// Get the current kernel thread id
+OSKernelThreadId osKernelThreadId (void);
+
+#endif /* CMINUSMINUS */
 
 #endif /* RTS_OSTHREADS_H */
