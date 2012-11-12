@@ -558,16 +558,16 @@ CLOSURE(stg_END_TSO_QUEUE_closure,stg_END_TSO_QUEUE);
 
    ------------------------------------------------------------------------- */
 
-INFO_TABLE(stg_ARR_WORDS, 0, 0, ARR_WORDS, "ARR_WORDS", "ARR_WORDS")
+INFO_TABLE(stg_ARR_WORDS, 0, 0, ARR_WORDS, "ByteArray#", "ByteArray#")
 { foreign "C" barf("ARR_WORDS object entered!") never returns; }
 
-INFO_TABLE(stg_MUT_ARR_PTRS_CLEAN, 0, 0, MUT_ARR_PTRS_CLEAN, "MUT_ARR_PTRS_CLEAN", "MUT_ARR_PTRS_CLEAN")
+INFO_TABLE(stg_MUT_ARR_PTRS_CLEAN, 0, 0, MUT_ARR_PTRS_CLEAN, "MutableArray#", "MutableArray#")
 { foreign "C" barf("MUT_ARR_PTRS_CLEAN object entered!") never returns; }
 
 INFO_TABLE(stg_MUT_ARR_PTRS_DIRTY, 0, 0, MUT_ARR_PTRS_DIRTY, "MUT_ARR_PTRS_DIRTY", "MUT_ARR_PTRS_DIRTY")
 { foreign "C" barf("MUT_ARR_PTRS_DIRTY object entered!") never returns; }
 
-INFO_TABLE(stg_MUT_ARR_PTRS_FROZEN, 0, 0, MUT_ARR_PTRS_FROZEN, "MUT_ARR_PTRS_FROZEN", "MUT_ARR_PTRS_FROZEN")
+INFO_TABLE(stg_MUT_ARR_PTRS_FROZEN, 0, 0, MUT_ARR_PTRS_FROZEN, "Array#", "Array#")
 { foreign "C" barf("MUT_ARR_PTRS_FROZEN object entered!") never returns; }
 
 INFO_TABLE(stg_MUT_ARR_PTRS_FROZEN0, 0, 0, MUT_ARR_PTRS_FROZEN0, "MUT_ARR_PTRS_FROZEN0", "MUT_ARR_PTRS_FROZEN0")
