@@ -159,12 +159,12 @@ setBlockAssigR assig = mkRegM $ \ s ->
 getContextR :: RegM freeRegs RA_Context
 getContextR = mkRegM $ \ s@RA_State{ra_context = ctx} -> RA_Result s ctx
 
-setBlockContextR :: [RegMap Loc] -> [(RealReg, Unique)] -> MoveDests
+setBlockContextR :: BlockId -> [RegMap Loc] -> [(RealReg, Unique)] -> MoveDests
                  -> RegM freeRegs ()
-setBlockContextR locs claims dests
+setBlockContextR bid locs claims dests
   = mkRegM $ \ s@RA_State{ra_context = ctx} ->
-  RA_Result s{ra_context = ctx{rc_jumpLocs = locs, rc_claims = claims
-                              , rc_moveDests = dests}} ()
+  RA_Result s{ra_context = ctx{rc_block = bid, rc_jumpLocs = locs
+                              , rc_claims = claims, rc_moveDests = dests}} ()
 
 setDeltaR :: Int -> RegM freeRegs ()
 setDeltaR n = mkRegM $ \ s ->
