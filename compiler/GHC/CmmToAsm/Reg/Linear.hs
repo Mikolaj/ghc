@@ -88,7 +88,7 @@ The algorithm is roughly:
         (i) Rewrite the instruction with the new mapping.
 
         (j) For each spilled reg known to be now dead, re-add its stack slot
-            to the free list.
+            to the free list (not done: a StackMap never frees a slot).
 
 -}
 
@@ -270,7 +270,7 @@ regAlloc _ _ _ (CmmProc _ _ _ _)
 
 -- | Do register allocation on some basic blocks.
 --   But be careful to allocate a block in an SCC only if it has
---   an entry in the block map or it is the first block.
+--   an entry in the block map or it is an entry block of the procedure.
 --
 linearRegAlloc
         :: forall instr. (Instruction instr)
@@ -1135,11 +1135,10 @@ iteration.
    before allocating one of its predecessors, which could lead to
    inconsistent allocations. Make it so a block is only allocated
    if a predecessor has set the "incoming" assignments for the block, or
-   if it's the procedure's entry block.
+   if it is one of the procedure's entry blocks.
 
-   BL 2009/02: Careful. If the assignment for a block doesn't get set for
-   some reason then this function will loop. We should probably do some
-   more sanity checking to guard against this eventuality.
+   A block whose assignment never gets set is dropped: process stops after
+   a round in which it allocates no block.
 -}
 
 process :: forall freeRegs instr. (RegAllocConstraint freeRegs instr)
@@ -1691,6 +1690,61 @@ releaseRegs regs = do
 --        - clobbered regs are not allocatable.
 --
 
+{- Note [Unique order in the linear allocator]
+   ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+Folds over the assignment visit its vregs in the order of their uniques, which
+compares their tags first and then their numbers. A vreg named in the Cmm keeps
+the unique of its local register, and the local register of an Id keeps the Id's
+unique (idToReg in GHC.StgToCmm.Env), so its tag is that of the pass that made
+the Id. -fobject-determinism renames every local register of StgToCmm's output,
+in the order it visits them, with uniques tagged 'Q', which sort before the
+instruction selector's 'n'. Among the tags that vregs carry are, in their order
+(that renaming replaces 'B', 'g', 'r', 't' and StgToCmm's own 'c'):
+
+* 'B', Ids that CorePrep's eta-expansion makes, such as the arguments of a
+  constructor worker's entry code at -O0;
+* 'H', on i386, the high half of a 64-bit vreg (getHiVirtualRegFromLo in
+  GHC.Platform.Reg);
+* 'T', the temporaries of -fcmm-thread-sanitizer;
+* 'c', StgToCmm's own temporaries, and a .cmm file's own registers;
+* 'g', Ids made from the supply of the STG pipeline's passes (runStgM in
+  GHC.Stg.Pipeline), such as the arguments that unarisation makes for an unboxed
+  sum;
+* 'n', the instruction selector's temporaries, and in a Haskell module the Cmm
+  pipeline's, as for a safe foreign call;
+* 'r', Ids whose uniques come from the name cache, which Tidy draws on for
+  top-level Ids: the register that holds a top-level closure in its own code is
+  one;
+* 't', Ids made from the supplies of CorePrep, CoreToStg and GHC.Stg.EnforceEpt,
+  among them CorePrep's clones of local Ids;
+* 'u', the Cmm pipeline's temporaries in a .cmm file.
+
+With -fobject-determinism the order in a Haskell module is deterministic but for
+the sanitizer's temporaries, which come from a supply the renaming leaves alone
+(Note [Unique Determinism and code generation] in GHC.Types.Unique).
+
+Nothing in the allocator chose this order, but two decisions take it as a
+ranking: allocRegsAndSpill_spill, where no register of the class needed is free,
+evicts a vreg in a register of the class, other than those being allocated
+for the instruction (keep): of those in both a register and their slot, else
+of those in a register only, the first it visits that it counts as read no
+more in the block, else the first it visits, whatever their preferences or
+the x86-64 order of free registers (evicting the last instead about doubles
+the reloads compiling perf/compiler's T3294 at -O0); and saveClobberedTemps
+finds new registers for the values an instruction clobbers in that order, so
+that, of the values a free register would suit, the later ones are spilled
+once those run out. Before ranking the vregs, and whether or not a register
+of the class is free, allocRegsAndSpill_spill gives the vreg being allocated
+the first register that the recorded jump-target assignments (rc_jumpLocs)
+give it, evicting its holder, if the holder is not kept, no instruction left
+in the block reads it, and one of those assignments has it in its slot and
+none in a register ('slotAhead'): a choice that does not depend on the order.
+makeRegMovementGraph lists a jump's moves in that order too, which decides the
+order of joinToTargets' fixup moves and which move of a cycle is made first, by
+a swap or through the stack. The other folds over the assignment do not depend
+on it.
+-}
+
 saveClobberedTemps
         :: forall instr freeRegs.
            (Instruction instr, FR freeRegs)
@@ -1707,9 +1761,8 @@ saveClobberedTemps [] _ _
 saveClobberedTemps clobbered dying rest
  = do
         assig   <- getAssigR
-        -- This is non-deterministic but we do not
-        -- currently support deterministic code-generation.
-        -- See Note [Unique Determinism and code generation]
+        -- The fold's order decides which values are spilled: see
+        -- Note [Unique order in the linear allocator]
         case nonDetStrictFoldUFM_Directly pick [] assig of
           -- nothing clobbered: the state unwritten, as in releaseRegs (written
           -- here alone, the compiler allocated 0.16% more compiling T9961 at
@@ -1820,9 +1873,8 @@ clobberRegs clobbered
 
         assig           <- getAssigR
         setAssigR $! nonDetStrictFoldUFM_Directly clobber assig assig
-          -- This is non-deterministic but we do not
-          -- currently support deterministic code-generation.
-          -- See Note [Unique Determinism and code generation]
+          -- Each vreg is updated on its own, so the fold's order does
+          -- not matter (Note [Unique Determinism and code generation])
 
    where
         -- if the temp was InReg and clobbered, then we will have
@@ -2491,12 +2543,16 @@ allocRegsAndSpill_spill reading !pos keep spills alloc r@(VirtualRegWithFormat v
                           -> (both, ReadNoMore (temp, RealRegUsage reg fmt))
                         _ -> acc
                       _ -> acc
-                    -- This is non-deterministic but we do not
-                    -- currently support deterministic code-generation.
-                    -- See Note [Unique Determinism and code generation].
-                    -- Only a vreg live out of the block can be read no more
-                    -- in it, so where none of the class is, the first of each
-                    -- kind is chosen, by `pick`.
+                    -- The fold's order picks the victim: see
+                    -- Note [Unique order in the linear allocator]. Only a vreg
+                    -- live out of the block can be read no more in it, so
+                    -- where none of the class is, the first of each kind is
+                    -- chosen, by `pick`, which does not build the map of
+                    -- last-read positions in the block's LastReads: by pickRead
+                    -- there too, the compiler ran 3.7% more instructions and
+                    -- allocated 0.21% more compiling T3294 at -O0, 1.8% and
+                    -- 0.11% more at -O and 1.8% and 0.10% more at -O2, on GHC
+                    -- 10.1.20261108.
                     (victim_inBoth, victim_inReg)
                       | lo
                       , (cand_inBoth, cand_inReg)
