@@ -302,6 +302,24 @@ import GHC.Types.Unique.DSM (UniqDSM)
   So we perform a preprocessing step where we adjust the weights of
   these kinds of edges.
 
+
+  Note [Latch edges after a cycle]
+  ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+  A loop whose test is at its bottom, the latch, ends in a conditional branch
+  to the loop's body and to its exit. 'buildChains' fuses the body into a chain
+  ending at the latch and then drops the latch's edge to the body, which would
+  close a cycle. The latch's other edge, to the exit, still carries the small
+  modifier of Note [Layout relevant edge weights], which assumes that a
+  conditional branch costs its jump whatever falls through. That no longer
+  holds: unless the exit falls through, the latch ends in a conditional jump
+  to the exit and a jump back to the body, which runs at every iteration. So
+  where 'buildChains' drops a conditional edge out of a chain's end into that
+  chain's start, it gives the branch's other edge, if still to be considered,
+  the dropped edge's weight where that is more and the edge's target, unplaced
+  or starting a chain, has no info table, which no block falls through into,
+  so that the exit falls through from the latch rather than from another
+  predecessor that the frequencies make as likely (GHC #27799).
+
   -}
 
 
@@ -570,12 +588,21 @@ mergeChains edges chains
 -- to be complete - it's only used to speed up the process.
 -- An Edge is irrelevant if the ends are part of the same chain.
 -- We say these edges are already linked
-buildChains :: [CfgEdge] -> [BlockId]
+buildChains :: LabelMap a -> CFG -> [CfgEdge] -> [BlockId]
             -> ( LabelMap BlockChain  -- Resulting chains, indexed by end if chain.
                , EdgeSet) --List of fused edges.
-buildChains edges blocks
+buildChains info cfg edges blocks
   = runST $ buildNext setEmpty mapEmpty mapEmpty edges mapEmpty
   where
+    -- the conditional branches' edges by source and target, for latchSibling
+    edgesFrom :: LabelMap (LabelMap CfgEdge)
+    edgesFrom = mapFromListWith mapUnion
+                  [ (edgeFrom e, mapSingleton (edgeTo e) e)
+                  | e <- edges, isCondBranch e ]
+    isCondBranch (CfgEdge _ _ (EdgeInfo CmmSource { trans_cmmNode = CmmCondBranch {} } _))
+      = True
+    isCondBranch _ = False
+
     -- buildNext builds up chains from edges one at a time.
 
     -- We keep a map from the ends of chains to the chains.
@@ -618,8 +645,9 @@ buildChains edges blocks
           (alreadyPlaced to)
         , Just predChain <- mapLookup from chainEnds
         , Just succChain <- mapLookup to chainStarts
-        , predChain /= succChain -- Otherwise we try to create a cycle.
-          = fuseChain predChain succChain
+          = if predChain /= succChain -- Otherwise we try to create a cycle.
+              then fuseChain predChain succChain
+              else buildNext placed chainStarts chainEnds latchSibling linked
 
         | (alreadyPlaced from) &&
           (alreadyPlaced to)
@@ -631,6 +659,41 @@ buildChains edges blocks
         from = edgeFrom edge
         to   = edgeTo   edge
         alreadyPlaced blkId = (setMember blkId placed)
+
+        -- The edges still to check once edge, which would close a cycle, is
+        -- dropped. See Note [Latch edges after a cycle]
+        latchSibling
+          | isCondBranch edge
+          , [sibTo] <- filter (/= to) (getSuccessors cfg from)
+          -- placed and starting no chain, it can follow no chain's end, and
+          -- with an info table, it is jumped to wherever it is placed
+          , not (alreadyPlaced sibTo) || mapMember sibTo chainStarts
+          , not (mapMember sibTo info)
+          , Just sib <- findSib sibTo
+          , isCondBranch sib
+          , edgeWeight (edgeInfo sib) < edgeWeight (edgeInfo edge)
+          = let sib' = sib { edgeInfo = (edgeInfo sib)
+                                          { edgeWeight = edgeWeight (edgeInfo edge) } }
+                -- sib' outranks every edge of todo, each below edge, by weight
+                -- or by source, and joins from, a chain's end, to sibTo,
+                -- unplaced or starting another chain; sib, left in todo, then
+                -- joins two placed blocks, from ending no chain, and is passed
+                -- over
+            in sib' : todo
+          | otherwise
+          = todo
+        -- the edge from from to sibTo: looked for among todo's first 64
+        -- edges, where it is as a rule, and else in edgesFrom, built once, at
+        -- the first such miss, where an edge lighter than edge is one still
+        -- in todo. Scanning todo whole made compiling N loops cost O(N^2);
+        -- edgesFrom built at the first latch, the compiler allocated 0.19%
+        -- more compiling a Cmm procedure of thousands of blocks at -O1 and
+        -- -O2, on GHC 10.1.20261109
+        findSib sibTo
+          | (e : _) <- [ e | e <- take 64 todo, edgeFrom e == from, edgeTo e == sibTo ]
+          = Just e
+          | otherwise
+          = mapLookup from edgesFrom >>= mapLookup sibTo
 
         -- Combine two chains into a single one.
         fuseChain :: STRef s BlockChain -> STRef s BlockChain
@@ -801,7 +864,7 @@ sequenceChain  info weights     blocks@((BasicBlock entry _):_) =
             = {-# SCC "buildChains" #-}
               --pprTraceIt "generatedChains" $
               --pprTrace "blocks" (ppr (mapKeys blockMap)) $
-              buildChains directEdges (mapKeys blockMap)
+              buildChains info weights directEdges (mapKeys blockMap)
 
         rankedEdges :: [CfgEdge]
         -- Sort descending by weight, remove fused edges
