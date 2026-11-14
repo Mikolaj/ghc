@@ -88,7 +88,7 @@ The algorithm is roughly:
         (i) Rewrite the instruction with the new mapping.
 
         (j) For each spilled reg known to be now dead, re-add its stack slot
-            to the free list.
+            to the free list (not done: a StackMap never frees a slot).
 
 -}
 
@@ -121,6 +121,8 @@ import GHC.CmmToAsm.Config
 import GHC.CmmToAsm.Format
 import GHC.CmmToAsm.Types
 import GHC.Platform.Reg
+import GHC.Platform.Reg.Class (RegClass)
+import GHC.Data.Word64Map.Internal (Word64Map (..))
 
 import GHC.Cmm.BlockId
 import GHC.Cmm.Dataflow.Label
@@ -133,12 +135,28 @@ import GHC.Types.Unique.DSM
 import GHC.Types.Unique.Set
 import GHC.Utils.Outputable
 import GHC.Utils.Panic
+import GHC.Utils.Monad (anyM)
+import qualified GHC.Data.Word64Map as M
 import GHC.Platform
+import qualified GHC.Platform.X86_64 as X86_64 (globalRegMaybe)
+import GHC.Exts (lazy)
 
 import Data.Containers.ListUtils
 import Data.Maybe
 import Data.List (find, sortOn)
+import Data.Array.IArray (Array, listArray, (!))
+import Data.Array.Unboxed (UArray)
+import Data.Array.ST (STUArray, newArray)
+import Data.Array.Base (unsafeRead, unsafeWrite, unsafeAt)
+import qualified Data.IntMap.Strict as IM
+import Data.Ord (Down (..))
+import qualified Data.IntSet as IS
+import qualified Data.Set as Set
+import Data.STRef (newSTRef, readSTRef, writeSTRef)
+import Control.Monad.ST (ST, runST)
+import Data.Word (Word64)
 import Control.Monad
+import GHC.CmmToAsm.CFG (BlockFreqs, blockFreq, blockFreqAt, blockIndex, blockCount)
 
 -- -----------------------------------------------------------------------------
 -- Top level of the register allocator
@@ -182,6 +200,7 @@ regAlloc
         :: Instruction instr
         => NCGConfig
         -> LabelSet
+        -> (BlockId -> BlockFreqs)
         -> LiveCmmDecl statics instr
         -> UniqDSM ( NatCmmDecl statics instr
                    , Maybe Int  -- number of extra stack slots required,
@@ -189,31 +208,45 @@ regAlloc
                    , Maybe RegAllocStats
                    )
 {-# SPECIALISE regAlloc
-      :: NCGConfig -> LabelSet -> LiveCmmDecl statics X86.Instr
+      :: NCGConfig -> LabelSet -> (BlockId -> BlockFreqs)
+      -> LiveCmmDecl statics X86.Instr
       -> UniqDSM (NatCmmDecl statics X86.Instr, Maybe Int, Maybe RegAllocStats)
   #-}
 
-regAlloc _ _ (CmmData sec d)
+regAlloc _ _ _ (CmmData sec d)
         = return
                 ( CmmData sec d
                 , Nothing
                 , Nothing )
 
-regAlloc _ _ (CmmProc (LiveInfo info _ _ _) lbl live [])
+regAlloc _ _ _ (CmmProc (LiveInfo info _ _ _ _) lbl live [])
         = return ( CmmProc info lbl live (ListGraph [])
                  , Nothing
                  , Nothing )
 
-regAlloc config cold (CmmProc static lbl live sccs)
-        | LiveInfo info entry_ids@(first_id:_) block_live _ <- static
+regAlloc config cold freqsFrom (CmmProc static lbl live sccs)
+        | LiveInfo info entry_ids@(first_id:_) block_live _ succs <- static
+        -- lazy: banged, so that at -O0 it was the static noBlockFreqs and no
+        -- thunk a procedure, it made the compiler run 0.015% and 0.010% more
+        -- instructions compiling T9961 and T12707 at -O0, and moved no figure
+        -- by 0.005% at -O or -O2, on GHC 10.1.20261108
+        , let freqs = freqsFrom first_id
         = do
                 -- do register allocation on each component.
                 !(!final_blocks, !stats, !stack_use)
-                        <- linearRegAlloc config cold entry_ids block_live sccs
+                        <- linearRegAlloc config cold freqs entry_ids block_live
+                                          succs sccs
 
                 -- make sure the block that was first in the input list
-                --      stays at the front of the output
-                let !final_blocks' = sortOn ((/= first_id) . blockId) final_blocks
+                --      stays at the front of the output, sorted only where it
+                --      is not: sorting always made the compiler run 0.36% more
+                --      instructions and allocate 0.48% more compiling T9961 at
+                --      -O0, 0.11% and 0.14% more compiling !16269's
+                --      CmmDiamondChain at -O and 0.10% and 0.14% more at -O2,
+                --      on GHC 10.1.20261108
+                let !final_blocks' = case final_blocks of
+                      b : _ | blockId b == first_id -> final_blocks
+                      _ -> sortOn ((/= first_id) . blockId) final_blocks
 
                 let max_spill_slots = maxSpillSlots config
                     extra_stack
@@ -227,7 +260,7 @@ regAlloc config cold (CmmProc static lbl live sccs)
                         , Just stats)
 
 -- bogus. to make non-exhaustive match warning go away.
-regAlloc _ _ (CmmProc _ _ _ _)
+regAlloc _ _ _ (CmmProc _ _ _ _)
         = panic "RegAllocLinear.regAlloc: no match"
 
 
@@ -237,20 +270,23 @@ regAlloc _ _ (CmmProc _ _ _ _)
 
 -- | Do register allocation on some basic blocks.
 --   But be careful to allocate a block in an SCC only if it has
---   an entry in the block map or it is the first block.
+--   an entry in the block map or it is an entry block of the procedure.
 --
 linearRegAlloc
         :: forall instr. (Instruction instr)
         => NCGConfig
         -> LabelSet  -- ^ the blocks that follow a failed heap or stack check
+        -> BlockFreqs -- ^ each block's estimated frequency
         -> [BlockId] -- ^ entry points
         -> BlockMap Regs
               -- ^ live regs on entry to each basic block
+        -> BlockMap [BlockId]
+              -- ^ each block's jump targets
         -> [SCC (LiveBasicBlock instr)]
               -- ^ instructions annotated with "deaths"
         -> UniqDSM ([NatBasicBlock instr], RegAllocStats, Int)
 
-linearRegAlloc config cold entry_ids block_live sccs
+linearRegAlloc config cold freqs entry_ids block_live js sccs
  = case platformArch platform of
       ArchX86        -> other $ (frInitFreeRegs platform :: X86.FreeRegs)
       ArchX86_64     -> go $ (frInitFreeRegs platform :: X86_64.FreeRegs)
@@ -270,7 +306,7 @@ linearRegAlloc config cold entry_ids block_live sccs
  where
   go :: FR regs
      => regs -> UniqDSM ([NatBasicBlock instr], RegAllocStats, Int)
-  go f = linearRegAlloc' config f cold entry_ids block_live sccs
+  go f = linearRegAlloc' config f cold freqs entry_ids block_live js sccs
   -- See Note [Specialising the linear allocator]
   other :: FR regs
         => regs -> UniqDSM ([NatBasicBlock instr], RegAllocStats, Int)
@@ -289,36 +325,130 @@ linearRegAlloc'
         -> freeRegs
         -> LabelSet                     -- ^ the blocks that follow a failed
                                         --   heap or stack check
+        -> BlockFreqs                   -- ^ each block's estimated frequency
         -> [BlockId]                    -- ^ entry points
         -> BlockMap Regs              -- ^ live regs on entry to each basic block
+        -> BlockMap [BlockId]           -- ^ each block's jump targets, read by
+                                        --   the allocation order and the
+                                        --   context alike
         -> [SCC (LiveBasicBlock instr)] -- ^ instructions annotated with "deaths"
         -> UniqDSM ([NatBasicBlock instr], RegAllocStats, Int)
 
-linearRegAlloc' config initFreeRegs cold entry_ids block_live sccs
+linearRegAlloc' config initFreeRegs cold !freqs entry_ids block_live js sccs
  = UDSM $ \us -> do
-    let !(_, !stack, !stats, !blocks, us') =
-            runR ctx emptyBlockAssignment initFreeRegs emptyRegMap emptyStackMap us
-                $ linearRA_SCCs cold entry_ids js block_live sccs
-        -- each block's jump targets, read by the allocation order and the
-        -- context alike
-        js = jumpSuccs sccs
+    let !(!stack, !stats, !blocks, us') =
+            runR ctx us
+                $ linearRA_SCCs cold freqs entry_ids js block_live sccs
         platform = ncgPlatform config
+        wv = wideMoveDests platform cold freqs block_live sccs
         ctx = RA_Context
                 { rc_jumpLocs  = []
                 , rc_moveDests = mkMoveDests emptyUFM
                 , rc_claims    = []
-                , rc_wideDests = wideMoveDests platform cold block_live sccs
+                , rc_wideDests = fst wv
+                , rc_via       = snd wv
                 , rc_block     = panic "linearRegAlloc': rc_block read before a block"
+                , rc_lastReads = LastReads emptyUFM [] []
                 , rc_succs     = js
+                  -- built where read
+                , rc_joins     = joinBlocks cold js
+                , rc_acyclicJoins = acyclicJoins js sccs
                 , rc_live      = block_live
-                , rc_dying     = mapFromList
-                    [ (b, listToUFM
-                            [ (vr, rr)
-                            | (vr, RegReal rr) <- dyingMoves platform instrs ])
-                    | BasicBlock b instrs <- flattenSCCs sccs ]
+                  -- only the blocks with such moves, built where first read
+                , rc_dying     = foldl' (dyingIn platform) mapEmpty (flattenSCCs sccs)
+                  -- used by x86-64's fallback alone, and elsewhere a thunk that
+                  -- would keep the SCCs alive (a plain map, the architecture
+                  -- tested where it is used, made the compiler run 0.010% more
+                  -- instructions compiling T3294 at -O0 and 0.004% and 0.003%
+                  -- more at -O and -O2, the cause unidentified, on GHC
+                  -- 10.1.20261108)
+                , rc_clobbers  = case platformArch platform of
+                    ArchX86_64 -> Just (regClobbers platform sccs)
+                    _          -> Nothing
+                , rc_initFree  = initFreeRegs
                 , rc_config    = config }
      in DUniqResult (blocks, stats, getStackUse stack) us'
 
+-- | For each virtual register, the real registers an instruction writes while
+-- the virtual register is live past it, as bits by register number: a C call's
+-- caller-saved registers, or R2's %r14 set for a jump, say. Given one of them,
+-- the virtual register would have to move out of it at that instruction. A move
+-- of the virtual register itself into one is no such write. The liveness pass
+-- records, at each instruction writing a real register, the registers live
+-- after it.
+--
+-- Every write counts, those in the blocks that follow a failed heap or stack
+-- check too, which run seldom.  TODO: a write could count by how often its
+-- block runs: see Note [Frequencies before register allocation] in
+-- GHC.CmmToAsm.CFG.
+regClobbers :: Instruction instr
+            => Platform -> [SCC (LiveBasicBlock instr)]
+            -> UniqFM VirtualReg Word64
+regClobbers platform sccs
+  = foldl' (\acc (hit, s) -> nonDetStrictFoldUniqSet (mark hit) acc s)
+           direct byHit
+  where
+    (direct, byHit) = foldl' (\m (BasicBlock _ instrs) -> foldl' ins m instrs)
+                             (emptyUFM, []) (flattenSCCs sccs)
+    -- each write's registers live past it: a small set marked at once, a vreg
+    -- at a time, its mask looked up; a large one, as most divisions
+    -- of !16269's CmmDiamondChain have, united with the others written with
+    -- the same mask, the masks marked at the end, which costs less than
+    -- a lookup for each vreg. Every set marked a vreg at a time, the compiler
+    -- ran 2.4% more instructions compiling CmmDiamondChain at -O0 and 2.0%
+    -- more at -O1 and -O2, but 0.12% fewer compiling T9961 at -O0; every set
+    -- united, 0.49% fewer for CmmDiamondChain at -O0 but 0.09% more for T9961,
+    -- allocating 0.29% more there, when this was added.
+    ins (!d, !m) (LiveInstr (Instr i) (Just l))
+      -- (the set is empty where the instruction writes no real register, which
+      -- the test finds sooner than the mask: the mask first, the compiler ran
+      -- 0.13% more instructions compiling T3294 at -O0 and 0.049% and 0.048%
+      -- more at -O and -O2, on GHC 10.1.20261108)
+      | not (isEmptyUniqSet (getRegs (liveAcross l)))
+      -- (the members counted only up to the threshold: sizeUniqSet, counting
+      -- them all, made the compiler run 0.29% more instructions compiling
+      -- !16269's CmmDiamondChain at -O0 and 0.24% more at -O and -O2, on GHC
+      -- 10.1.20261108; the 24, above which a set is large, is arbitrary, and
+      -- may be revised where a case needs it: with no set large, compiling a
+      -- block of 50 to 400 unsafe C calls ran 1.004 to 1.086 times the
+      -- instructions, the excess growing as N squared)
+      , hit /= 0 = if M.compareSize (ufmToIntMap (getUniqSet across)) 24 == GT
+                     then (d, add m)
+                     else (nonDetStrictFoldUniqSet (mark hit) d across, m)
+      where
+        RU rs ws = liveUsage l
+        hit  = foldl' (\b r -> case regWithFormat_reg r of
+                                 RegReal (RealRegSingle n) -> setBit b n
+                                 _                         -> b) 0 ws
+        -- live past the instruction: live after it, and not only written
+        -- by it; a move of the vreg itself into a real register is no
+        -- clobber of it
+        excl = [ v | Just (RegVirtual v, RegReal _) <- [takeRegRegMoveInstr platform i] ]
+               ++ [ v | r <- ws, RegVirtual v <- [regWithFormat_reg r], not (has v rs) ]
+        across = foldl' (\s v -> delOneFromUniqSet_Directly s (getUnique v))
+                         (getRegs (liveAcross l)) excl
+        -- (unionUniqSetsShared, not unionUniqSets: the liveness pass builds the
+        -- sets live across consecutive instructions from one another, so they
+        -- share all but a few paths, and the set they are united into stays the
+        -- newest set itself while every older one is part of it: in a block of
+        -- N unsafe C calls, each with the results of the calls before it live
+        -- across it, a union walks a few paths, where unionUniqSets copied the
+        -- whole set, O(N) a call. With unionUniqSets the compiler ran 3.5% more
+        -- instructions compiling a block of 400 such calls at -O1, and 0.13% to
+        -- 0.15% more, allocating 0.86% to 1.0% more, compiling a Cmm procedure
+        -- of many basic blocks, on GHC 10.1.20261109)
+        add [] = [(hit, across)]
+        add (e@(h, s) : es)
+          | h == hit  = let !s' = unionUniqSetsShared s across in (h, s') : es
+          | otherwise = e : add es
+        has v = any (\r -> case regWithFormat_reg r of
+                              RegVirtual v' -> v' == v
+                              _             -> False)
+    ins dm _ = dm
+    mark hit r a = case regWithFormat_reg r of
+      RegVirtual v | lookupWithDefaultUFM a 0 v .&. hit /= hit
+                   -> addToUFM_C (.|.) a v hit
+      _            -> a
 
 -- | The virtual register the instruction moves where it dies, and the move's
 -- destination, if it is such a move.
@@ -378,16 +508,23 @@ dyingMovesLast platform instrs = fst $ foldr step ([], emptyUniqSet) instrs
 -- is moved into that register in the same block, where the later vreg dies. A
 -- vreg that the vreg is moved into where it dies counts as the vreg in this
 -- check, where the move is in a block some vreg is live into and not one of the
--- given ones. The walk of each block follows only those vregs and registers,
--- taking an instruction's writes from its register usage ('liveBorn' being
--- filled in only for the graph allocator and the liveness dump).
+-- given ones. A vreg moved so into a vreg with a register here has that
+-- register too, up to four such moves back, so that its value is computed
+-- there, unless the check leaves it out; the second map gives each vreg moved
+-- so, left out or not, the vreg it is moved into. The walk of each block
+-- follows only those vregs and registers, taking an instruction's writes from
+-- its register usage ('liveBorn' being filled in only for the graph allocator
+-- and the liveness dump).
 wideMoveDests :: Instruction instr
-              => Platform -> LabelSet -> BlockMap Regs
+              => Platform -> LabelSet -> BlockFreqs -> BlockMap Regs
               -> [SCC (LiveBasicBlock instr)]
-              -> UniqFM VirtualReg RealReg
-wideMoveDests platform cold block_live sccs
-  | isNullUFM cands = cands
-  | otherwise       = cands `minusUFM` foldl' blk emptyUFM blocks
+              -> (UniqFM VirtualReg RealReg, UniqFM VirtualReg VirtualReg)
+wideMoveDests platform cold freqs block_live sccs
+  -- (no candidates, no walk: the walk over every block, which then marks
+  -- nothing, made the compiler allocate 0.015% more compiling T9961 at -O0, and
+  -- moved no figure by 0.005% at -O or -O2, on GHC 10.1.20261108)
+  | isNullUFM cands = (cands, via)
+  | otherwise       = (cands `minusUFM` foldl' blk emptyUFM blocks, via)
   where
     blocks = flattenSCCs sccs
     live_in bid = mapFindWithDefault noRegs bid block_live
@@ -402,29 +539,55 @@ wideMoveDests platform cold block_live sccs
     -- A destination no allocator hands out, Sp, Hp or BaseReg, and on AArch64,
     -- RV64 and LA64 those of the argument registers, R1 among them, stays a
     -- candidate here and in processBlock's move destinations, harmless but
-    -- where it is the last block's and shadows a usable one.
-    -- One walk finds them, and the moves of a vreg into another where it dies
-    -- in the same blocks, of which follow takes those of candidates: a walk
-    -- for each made the compiler run 0.39% more instructions compiling
-    -- !16269's CmmDiamondChain at -O0 and 0.18% more compiling T12707 and
-    -- T9961 at -O0 when this was added.
-    (cands, vmoves) = foldl' blkMoves (emptyUFM, []) blocks
+    -- where it is the last block's and shadows a usable one or, on x86-64, is a
+    -- vreg's only preference, which fallbackReg counts as one.
+    -- Four moves back, bounding back's passes, is arbitrary, and may be raised
+    -- where a case needs more at little cost to the compiler: lifted to 1000,
+    -- compiling a loop that rotates 50 to 400 variables ran 1.02 to 1.19 times
+    -- the instructions, the excess growing as N squared.
+    (cands, via) = back (4 :: Int) (direct, emptyUFM)
+    direct = mapUFM fst directAt
+    -- One walk finds them, with the block of the move, and the moves of a vreg
+    -- into another where it dies in the same blocks, which back and follow
+    -- take: a walk for each made the compiler run 0.46% more instructions
+    -- compiling !16269's CmmDiamondChain at -O0, 0.39% more at -O and 0.38%
+    -- more at -O2, on GHC 10.1.20261108.
+    (directAt, vmovesR) = foldl' blkMoves (emptyUFM, []) blocks
     blkMoves acc (BasicBlock bid instrs)
       | warm bid live = foldl' mv acc (dyingMoves platform instrs)
       | otherwise     = acc
       where
         live = live_in bid
         mv (!cs, !vm) (vr, RegReal rr)
-          | RegVirtual vr `elemRegs` live = (addToUFM cs vr rr, vm)
+          | RegVirtual vr `elemRegs` live = (addToUFM cs vr (rr, bid), vm)
         mv (!cs, !vm) (a, RegVirtual b)   = (cs, (a, b) : vm)
         mv csvm _                         = csvm
+    -- a vreg moved where it dies into a candidate, the move coalescing the two,
+    -- has the candidate's destination too, so that the value is computed there
+    -- from the start, and the candidate as the vreg it is moved into: up to
+    -- four such moves back
+    back :: Int -> (UniqFM VirtualReg RealReg, UniqFM VirtualReg VirtualReg)
+         -> (UniqFM VirtualReg RealReg, UniqFM VirtualReg VirtualReg)
+    back 0 cv = cv
+    back n cv@(c, w)
+      | isNullUFM c = cv
+      | null new    = cv
+      | otherwise   = back (n - 1)
+                        ( plusUFM c (listToUFM [ (a, d) | (a, _, d) <- new ])
+                        , plusUFM w (listToUFM [ (a, b) | (a, b, _) <- new ]) )
+      where new = [ (a, b, d) | (a, b) <- vmoves, not (a `elemUFM` c)
+                              , Just d <- [lookupUFM c b] ]
+    -- the moves of vregs into vregs where they die, in the blocks warm takes,
+    -- in the walk's order, of which back keeps a vreg's last
+    vmoves = reverse vmovesR
     dests = mkUniqSet (nonDetEltsUFM cands)
     -- each followed vreg to the candidates whose values it holds, with their
     -- destinations: a candidate itself, and each candidate moved into the
     -- vreg where it dies
     follow = plusUFM_C (++) (mapUFM_Directly (\u d -> [(u, d)]) cands)
            $ listToUFM_C (++)
-      [ (b, [(getUnique a, d)]) | (a, b) <- vmoves, Just d <- [lookupUFM cands a] ]
+      [ (b, [(getUnique a, d)])
+      | (a, b) <- vmoves, Just d <- [lookupUFM cands a] ]
     -- bad: the candidates found live together with their destination;
     -- vs: the followed vregs live; ds: the destinations live
     blk bad (BasicBlock bid instrs)
@@ -437,41 +600,43 @@ wideMoveDests platform cold block_live sccs
                                        , rr `elementOfUniqSet` dests ]
         in go loc bad' vs ds instrs
     -- a block finds a candidate bad only where a destination is live into
-    -- it or written in it, a move into one where a vreg dies included:
-    -- elsewhere no destination is live during its walk, which then marks
-    -- nothing; walking every block made the compiler run 3.8% more
-    -- instructions compiling !16269's CmmDiamondChain at -O0 and 3.1% more at
-    -- -O1 and -O2 when this was added
+    -- it or written in it, a move into one where a vreg dies included, or,
+    -- where candidates are propagated, where it writes a vreg with a
+    -- destination directly (wantedDirect): elsewhere no destination is live
+    -- during its walk and no such vreg is born, so that it marks nothing;
+    -- walking every block made the compiler run 3.8% more instructions
+    -- compiling !16269's CmmDiamondChain at -O0 and 3.1% more at -O1 and -O2
+    -- when this was added
     touched bid instrs
       =  any (\rr -> RegReal rr `elemRegs` live_in bid) destList
       || any writesDest instrs
+      || not (isNullUFM via) && any writesDirect instrs
     destList = nonDetEltsUniqSet dests
     writesDest (LiveInstr (Instr _) (Just l)) = any isDest (writes (liveUsage l))
     writesDest _ = False
     isDest r = case regWithFormat_reg r of
       RegReal rr -> rr `elementOfUniqSet` dests
       _          -> False
+    writesDirect (LiveInstr (Instr _) (Just l)) = any isDirect (writes (liveUsage l))
+    writesDirect _ = False
+    isDirect r = case regWithFormat_reg r of
+      RegVirtual v -> v `elemUFM` direct
+      _            -> False
     go _ !bad !_ !_ [] = bad
     go loc !bad !vs !ds (LiveInstr (Instr _) (Just l) : is)
-      | quiet (liveDieRead l), not (any seen ws), quiet (liveDieWrite l)
-      , isEmptyUniqSet vs || not (any (local loc) ws)
-      = go loc bad vs ds is
-      | otherwise
       = let !(vs1, ds1)       = dies (vs, ds) (liveDieRead l)
-            -- (no followed vreg live, no candidate wanted: the fold over the
+            -- (no followed vreg live, no candidate wanted: the folds over the
             -- writes anyway made the compiler run 0.051% more instructions
             -- compiling nofib's puzzle at -O0 and 0.015% and 0.014% more at -O
             -- and -O2, on GHC 10.1.20261108)
             bad1 | isEmptyUniqSet vs1 = bad
-                 | otherwise          = foldl' (wanted loc vs1) bad ws
+                 | otherwise          = foldl' (wantedDirect vs1)
+                                          (foldl' (wanted loc vs1) bad ws) ws
             !(bad', vs2, ds2) = foldl' (flip bear) (bad1, vs1, ds1) ws
             !(vs3, ds3)       = dies (vs2, ds2) (liveDieWrite l)
         in go loc bad' vs3 ds3 is
       where ws = writes (liveUsage l)
     go loc !bad !vs !ds (_ : is) = go loc bad vs ds is
-    local loc r = case regWithFormat_reg r of
-      RegVirtual v -> v `elemUFM` loc
-      RegReal _    -> False
     -- a vreg born with a destination in loc: the live followed vregs'
     -- candidates with that destination are bad, but the vreg's own, which an
     -- update in place keeps in its register
@@ -479,11 +644,24 @@ wideMoveDests platform cold block_live sccs
       RegVirtual v
         | Just w <- lookupUFM loc v -> clash w bad (delOneFromUniqSet vs v)
       _ -> bad
-    -- none of the registers names a followed vreg or a destination
-    quiet regs = not (uniqSetAny seen (getRegs regs))
-    seen r = case regWithFormat_reg r of
-      RegVirtual v -> v `elemUFM` follow
-      RegReal rr   -> rr `elementOfUniqSet` dests
+    -- a propagated candidate yields its destination to a vreg with that
+    -- destination directly, born while it is live, where the direct vreg's move
+    -- into the register is estimated to run more often than the move into it at
+    -- the end of the candidate's chain, by the block frequencies, which inherit
+    -- static prediction's errors on tag tests (Note [Static prediction of tag
+    -- tests] in GHC.CmmToAsm.CFG)
+    wantedDirect vs bad r = case regWithFormat_reg r of
+      RegVirtual v
+        | Just w <- lookupUFM direct v
+        -> nonDetStrictFoldUniqSet
+             (\x b -> if x /= v && x `elemUFM` via && lookupUFM cands x == Just w
+                         && hotter v x
+                        then addToUFM b x () else b)
+             bad vs
+      _ -> bad
+    hotter d p = moveFreq d > moveFreq (chainEnd p)
+    moveFreq u = maybe 0 (blockFreq freqs . snd) (lookupUFM directAt u)
+    chainEnd p = maybe p chainEnd (lookupUFM via p)
     dies acc regs = nonDetStrictFoldUniqSet die acc (getRegs regs)
     die r acc@(!vs, !ds) = case regWithFormat_reg r of
       RegVirtual v | v `elementOfUniqSet` vs  -> (delOneFromUniqSet vs v, ds)
@@ -513,8 +691,8 @@ wideMoveDests platform cold block_live sccs
 -- | Allocate the SCCs in order, except that the blocks the garbage collector
 -- returns to after a heap or stack check fails (the entry blocks in the given
 -- set, those in a cycle excepted), and any SCC only they lead to, go after the
--- others. The first jump allocated into a block records the registers it starts
--- with, and later jumps into it move their values to match
+-- others. The first jump allocated into a block records where its live-in vregs
+-- are, and later jumps into it move their values to match
 -- (Note [The first jump into a block fixes its registers]). Where such a block
 -- jumps back to the block that made the check, which the hot path also enters,
 -- allocating it first would let its reloads choose that block's registers,
@@ -524,17 +702,37 @@ wideMoveDests platform cold block_live sccs
 -- vreg being live into an entry; a vreg that was would make the allocator panic
 -- where it is read.
 --
--- TODO: checkFailures counts as cold some blocks the hot path runs: see
--- Note [Frequencies before register allocation] in GHC.CmmToAsm.CFG.
+-- Where the blocks' frequencies are estimated (on x86-64, under
+-- -fcmm-static-pred), the SCCs go in 'hotFirst''s order instead: the
+-- procedure's first block first, then hotter first among those that can be
+-- allocated, another entry as hot as the hottest of itself and the blocks it
+-- jumps to, estimates counted in factors of 1.2 (the floor of their logarithm
+-- to that base); and an entry other than the procedure's first block set aside
+-- while a block it jumps to, not yet reached, runs more than 1.2 times as
+-- often as the entry, other paths bringing it at least a sixth of its runs:
+-- allocated first, the entry would choose the registers of a block those paths
+-- run, as a block the garbage collector returns to or a continuation entering
+-- a loop would (GHC #27800). The estimate of a tag test is static prediction's
+-- (Note [Static prediction of tag tests]), which can leave an unannotated test
+-- of a pointer's tag at 50/50; the factor damps what that makes of the paths
+-- around an evaluation.
+--
+-- TODO: without the estimate, checkFailures counts as cold some blocks the hot
+-- path runs: see Note [Frequencies before register allocation] in
+-- GHC.CmmToAsm.CFG.
 linearRA_SCCs :: RegAllocConstraint freeRegs instr
               => LabelSet
+              -> BlockFreqs
               -> [BlockId]
               -> BlockMap [BlockId]
               -> BlockMap Regs
               -> [SCC (LiveBasicBlock instr)]
               -> RegM freeRegs [NatBasicBlock instr]
 
-linearRA_SCCs cold entry_ids succs block_live sccs
+linearRA_SCCs cold freqs entry_ids succs block_live sccs
+ | blockCount freqs > 0
+ = reverse <$> foldM one [] (hotFirst freqs entries first_id succs sccs)
+ | otherwise
  = do   let -- a block the garbage collector returns to, or a return
             -- continuation that jumps into a loop with no call (GHC #27800)
             deferrable assig (AcyclicSCC (BasicBlock bid _))
@@ -572,11 +770,343 @@ linearRA_SCCs cold entry_ids succs block_live sccs
     clobbersMany li
       = length [ () | RegWithFormat (RegReal _) _ <- writes (liveInstrUsage li) ] > 4
     one acc (AcyclicSCC block) = do
-        blocks' <- processBlock succs block_live block
+        blocks' <- processBlock False succs block_live block
         return (reverse blocks' ++ acc)
     one acc (CyclicSCC blocks) = do
         blockss' <- process entries succs block_live blocks
         return (reverse (concat blockss') ++ acc)
+
+-- | The SCCs in the order linearRA_SCCs allocates them where it has the blocks'
+-- estimated frequencies: hotter first among those it can allocate, an entry,
+-- or an SCC a jump from an allocated one reaches, an SCC's heat being its
+-- hottest block's estimate in factors of 1.2 (the floor of its logarithm to
+-- that base), and ties going to the earlier in the given order (dependency
+-- order, Note [The first jump into a block fixes its registers]).  Static
+-- prediction can leave an unannotated test of a pointer's tag 50/50 (Note
+-- [Static prediction of tag tests]), so the paths around an evaluation can
+-- come out about as hot, and the given order decides between them, as it did
+-- without the estimate: Data.IntSet's fromAscList loop otherwise took its
+-- head's registers from the procedure's entry path, the arguments' (0.75),
+-- before the join of its evaluations' continuations (0.716), and paid two
+-- moves an element on its back edge. The procedure's first block, where no
+-- loop holds it, counts as hotter than any other: it jumps with the arguments
+-- where the calling convention puts them, which a loop calling a function again
+-- takes again, where a continuation's values are where its evaluation left
+-- them (Data.Tree's and Data.Map's folds paid three instructions a node when
+-- the continuation went first). An entry other than the first block, where
+-- no loop holds it, counts as hot as the hottest of itself and the blocks
+-- it jumps to: a continuation reloads its values, and the block it jumps to
+-- takes its registers, which may be a path's that the estimate calls hotter
+-- but where those values are spilled, as where a loop's every iteration calls
+-- (nofib's fannkuch-redux at -O1 stored eight values on its edge an iteration
+-- when the path went first); ranked above every SCC but the first block, the
+-- entries cost Data.IntSet's mapMonotonic at -O2 two instructions an element,
+-- its loop's continuation going after colder ones. An entry other than the
+-- first block is set aside while a block it jumps to, not yet reached, runs
+-- more than 1.2 times as often as it, and tested again whenever one of its
+-- targets is reached. Where nothing can be allocated, the entry set aside
+-- that the estimate calls hottest is, ties to the earlier, or where none is,
+-- the earliest SCC left: two continuations joining wait for each other, and
+-- the hotter's registers are the join's (Data.IntMap's mapKeysMonotonic at
+-- -O1 paid an instruction an element when the colder went first). A cyclic SCC
+-- holding a block whose first jump target in it and another differ in estimate
+-- by a factor of 1.2, and entered at one block, reached from outside it or an
+-- entry, goes hottest block first ('hotOrder'), so that the hotter side of
+-- the branch fixes its join's registers and the colder side pays the moves:
+-- megaparsec's skipManyTill ran 5% fewer instructions, and nofib's wheel-sieve1
+-- 1% fewer. Entered at more blocks, its joins also meet registers fixed apart
+-- from the order, an outside predecessor's at a block reached from outside and
+-- none at an entry, into which no vreg is live, and the order would rank such
+-- blocks by an entry's heat, the estimate's guess for the call or evaluation
+-- returning to it: so ordered, nofib's puzzle at -O2, whose loops are entered
+-- at twenty blocks and at four, ran no faster, and the compiler ran 0.15% more
+-- instructions compiling it, when this was added, on GHC 10.1.20261108. The
+-- order depends on the jumps alone, not on what allocation records, so it is
+-- computed before allocation. NOINLINE: inlined, its local thunks are allocated
+-- for every procedure, at -O0 too, where it is not called, and the compiler
+-- allocated 0.064% more compiling T9961 at -O0 and 0.042%, 0.012% and 0.011%
+-- more compiling T12707 at -O0, -O and -O2, though it ran 0.13% fewer
+-- instructions for T9961 at -O0 and 0.076%, 0.019% and 0.018% fewer for T12707,
+-- the cause of that unidentified, on GHC 10.1.20261108.
+{-# NOINLINE hotFirst #-}
+hotFirst :: forall b. BlockFreqs -> LabelSet -> BlockId -> BlockMap [BlockId]
+         -> [SCC (GenBasicBlock b)] -> [SCC (GenBasicBlock b)]
+hotFirst freqs entries first_id succs sccs
+  = runST $ do
+      -- (unchecked reads and writes, unsafeRead, unsafeWrite and unsafeAt here
+      -- and unsafeRead in hotOrder: readArray, writeArray and (!) in their
+      -- place, while hotOrder kept its heap in an STUArray, made the compiler
+      -- run 0.080% more instructions and allocate 0.036% more compiling T12707
+      -- at -O, and run 0.091% more compiling nofib's puzzle at -O2, on GHC
+      -- 10.1.20261108)
+      -- each block's SCC, four times its index, plus 1 once a jump reaches it,
+      -- 3 where the first jump is from the block's own SCC
+      blockScc <- newArray (0, max 0 (nb - 1)) (-4) :: ST s (STUArray s Int Int)
+      known <- foldM (\ok (i, scc) ->
+                        foldM (\ok' blk -> case blockIndex freqs (blockId blk) of
+                                  j | j < 0     -> return False
+                                    | otherwise -> unsafeWrite blockScc j (4 * i)
+                                                   >> return ok')
+                              ok (flattenSCC scc))
+                     True (zip [0 ..] sccs)
+      if not known then return sccs  -- not expected: the CFG holds every block
+      else do
+        -- 0 not yet reached, 1 in the heap, 2 allocated, 3 set aside; the
+        -- heap's size at k
+        status <- newArray (0, k) (0 :: Int) :: ST s (STUArray s Int Int)
+        -- a binary heap: a Data.Set on (Down heat, i), the same order, made the
+        -- compiler run 0.066% more instructions and allocate 0.11% more
+        -- compiling T12707 at -O, and 0.079% and 0.11% more compiling nofib's
+        -- puzzle at -O2, and nothing at -O0, where hotFirst is not called, on
+        -- GHC 10.1.20261108
+        heap <- newArray (0, k - 1) 0 :: ST s (STUArray s Int Int)
+        -- the set-aside entries to test again when a block is reached
+        waitOn <- newSTRef (IM.empty :: IM.IntMap [Int])
+        asideRef <- newSTRef ([] :: [Int])
+        let better i j = let hi = unsafeAt heat i; hj = unsafeAt heat j
+                         in hi > hj || (hi == hj && i < j)
+            swap a c = do x <- unsafeRead heap a
+                          y <- unsafeRead heap c
+                          unsafeWrite heap a y
+                          unsafeWrite heap c x
+            up 0 = return ()
+            up c = do let p = (c - 1) `quot` 2
+                      x <- unsafeRead heap c
+                      y <- unsafeRead heap p
+                      when (better x y) $ swap c p >> up p
+            down n p = do
+              let l = 2 * p + 1
+                  r = l + 1
+              if l >= n then return () else do
+                x <- unsafeRead heap l
+                c <- if r < n then do y <- unsafeRead heap r
+                                      return (if better y x then r else l)
+                              else return l
+                cv <- unsafeRead heap c
+                pv <- unsafeRead heap p
+                when (better cv pv) $ swap c p >> down n c
+            push i = do
+              unsafeWrite status i 1
+              n <- unsafeRead status k
+              unsafeWrite heap n i
+              unsafeWrite status k (n + 1)
+              up n
+            pop = do
+              n <- unsafeRead status k
+              top <- unsafeRead heap 0
+              unsafeRead heap (n - 1) >>= unsafeWrite heap 0
+              unsafeWrite status k (n - 1)
+              down (n - 1) 0
+              return top
+            isReached' d = case blockIndex freqs d of
+              j | j < 0     -> return False
+                | otherwise -> (\v -> v .&. 1 /= 0) <$> unsafeRead blockScc j
+            -- whether an SCC is an entry set aside now
+            waitsNow i = case sccArr ! i of
+              AcyclicSCC (BasicBlock bid _)
+                | bid `setMember` entries, bid /= first_id
+                -> let f = 1.2 * blockFreq freqs bid
+                   in anyM (\d -> if blockFreq freqs d > f
+                                    then not <$> isReached' d
+                                    else return False)
+                           (mapFindWithDefault [] bid succs)
+              _ -> return False
+            setAside i = do
+              unsafeWrite status i 3
+              readSTRef asideRef >>= writeSTRef asideRef . (i :)
+              forM_ (mapFindWithDefault [] (sccBlockId i) succs) $ \d -> do
+                let j = blockIndex freqs d
+                when (j >= 0) $ do
+                  v <- unsafeRead blockScc j
+                  when (v .&. 1 == 0) $ readSTRef waitOn >>= \wm ->
+                    writeSTRef waitOn $! IM.insertWith (++) j [i] wm
+            -- allocate SCC i, giving it as it goes in the order: a cyclic one
+            -- holding a block whose first jump target in it and another differ
+            -- in estimate by a factor of 1.2 as 'hotOrder' orders it
+            allocate i = do
+              unsafeWrite status i 2
+              case sccArr ! i of
+                scc@(AcyclicSCC blk) -> do
+                  forM_ (mapFindWithDefault [] (blockId blk) succs) $ \d -> do
+                    let j = blockIndex freqs d
+                    when (j >= 0) $ unsafeRead blockScc j >>= reach i j
+                  return scc
+                scc@(CyclicSCC blks) -> do
+                  imb <- foldM (\a blk ->
+                                  case mapFindWithDefault [] (blockId blk) succs of
+                                    [d] -> one i d >> return a
+                                    [d1, d2] | not a -> two i d1 d2
+                                    ds -> walk i (-1) a ds)
+                               False blks
+                  if imb then hotOrder freqs entries succs blockScc blks
+                         else return scc
+            -- the one jump target of a block of SCC i reached
+            {-# INLINE one #-}
+            one i d = let j = blockIndex freqs d
+                      in when (j >= 0) $ unsafeRead blockScc j >>= reach i j
+            -- the two jump targets of a block of SCC i reached, and whether
+            -- both are in SCC i and differ in estimate by a factor of 1.2;
+            -- reach leaves the SCC each element of blockScc holds as it was
+            {-# INLINE two #-}
+            two i d1 d2 = do
+              let j1 = blockIndex freqs d1
+                  j2 = blockIndex freqs d2
+              when (j1 >= 0) $ unsafeRead blockScc j1 >>= reach i j1
+              when (j2 >= 0) $ unsafeRead blockScc j2 >>= reach i j2
+              if j1 < 0 || j2 < 0 then return False else do
+                v1 <- unsafeRead blockScc j1
+                v2 <- unsafeRead blockScc j2
+                let f1 = blockFreqAt freqs j1
+                    f2 = blockFreqAt freqs j2
+                return $! v1 `shiftR` 2 == i && v2 `shiftR` 2 == i
+                          && (f1 > 1.2 * f2 || f2 > 1.2 * f1)
+            -- the jump targets of a block of SCC i reached, and whether the
+            -- first in SCC i and another differ in estimate by a factor of 1.2,
+            -- r the first one's index (-1 none yet)
+            walk !_ !_ !a [] = return a
+            walk i r a (d : ds) = case blockIndex freqs d of
+              j | j < 0     -> walk i r a ds
+                | otherwise -> do
+                    v <- unsafeRead blockScc j
+                    reach i j v
+                    if v `shiftR` 2 /= i then walk i r a ds
+                    else if r < 0 then walk i j a ds
+                    else let f = blockFreqAt freqs j
+                             g = blockFreqAt freqs r
+                         in walk i r (a || f > 1.2 * g || g > 1.2 * f) ds
+            -- the block at index j, whose entry is v, reached by a jump from
+            -- SCC i
+            {-# INLINE reach #-}
+            reach i j v = when (v .&. 1 == 0) $ do
+              let s = v `shiftR` 2
+              unsafeWrite blockScc j (if s == i then v + 3 else v + 1)
+              when (s >= 0) $ do
+                st <- unsafeRead status s
+                when (st == 0) $ push s
+              wm <- readSTRef waitOn
+              case IM.lookup j wm of
+                Nothing -> return ()
+                Just ws -> do
+                  writeSTRef waitOn $! IM.delete j wm
+                  forM_ ws $ \w -> do
+                    st <- unsafeRead status w
+                    when (st == 3) $ do
+                      stillWaits <- waitsNow w
+                      unless stillWaits $ push w
+            -- the earliest SCC not yet reached, from a cursor that only
+            -- advances, as an SCC's status never returns to 0
+            unreached c | c >= k    = return Nothing
+                        | otherwise = do st <- unsafeRead status c
+                                         if st == 0 then return (Just c)
+                                                    else unreached (c + 1)
+            go out cur = do
+              n <- unsafeRead status k
+              if n > 0 then do
+                i <- pop
+                w <- waitsNow i
+                if w then setAside i >> go out cur
+                     else allocate i >>= \scc -> go (scc : out) cur
+              else do
+                u <- unreached cur
+                aside <- filterM (\i -> (== 3) <$> unsafeRead status i) =<< readSTRef asideRef
+                writeSTRef asideRef aside
+                let hotter j i = blockFreq freqs (sccBlockId j)
+                                 > blockFreq freqs (sccBlockId i)
+                    -- the hotter, ties to the earlier
+                    pref i j | hotter j i || (not (hotter i j) && j < i) = j
+                             | otherwise                                = i
+                    pick = case aside of
+                      a : as -> Just (foldl' pref a as)
+                      []     -> u
+                case pick of
+                  Just i  -> do scc <- allocate i
+                                go (scc : out) (maybe cur id u)
+                  Nothing -> return (reverse out)
+        forM_ (setElems entries) $ \e -> do
+          let j = blockIndex freqs e
+          when (j >= 0) $ do
+            v <- unsafeRead blockScc j
+            let s = v `shiftR` 2
+            when (s >= 0) $ do st <- unsafeRead status s
+                               when (st == 0) $ push s
+        go [] 0
+  where
+    k = length sccs
+    nb = blockCount freqs
+    sccArr = listArray (0, k - 1) sccs :: Array Int (SCC (GenBasicBlock b))
+    sccBlockId i = case flattenSCC (sccArr ! i) of
+      blk : _ -> blockId blk
+      []      -> panic "hotFirst: an empty SCC"
+    -- the first block hotter than any other, another entry by the hottest of
+    -- itself and its jump targets, the others by their hottest block's
+    -- estimate, in factors of 1.2
+    heat :: UArray Int Int
+    heat = listArray (0, k - 1)
+      [ case scc of
+          AcyclicSCC blk
+            | blockId blk == first_id           -> maxBound
+            | blockId blk `setMember` entries
+            -> bucket $ foldl' (\a d -> max a (blockFreq freqs d))
+                               (blockFreq freqs (blockId blk))
+                               (mapFindWithDefault [] (blockId blk) succs)
+          _ -> bucket $ foldl' (\a blk -> max a (blockFreq freqs (blockId blk)))
+                               0 (flattenSCC scc)
+      | scc <- sccs ]
+
+-- | An estimated frequency in factors of 1.2, the floor of its logarithm to
+-- that base, so that blocks of about the same heat count as equal.
+bucket :: Double -> Int
+bucket h | h > 0     = floor (log h / log 1.2)
+         | otherwise = minBound
+
+-- | The blocks of a cyclic SCC of hotFirst's, every one of which a jump has
+-- reached (blockScc's entries), in the order of allocation: hottest reached
+-- block first, by 'bucket', ties to the earlier in the given order, each
+-- block's jump targets in the SCC reached as it goes, where exactly one block
+-- was reached from outside the SCC or is an entry; given as they are otherwise.
+hotOrder :: forall s b. BlockFreqs -> LabelSet -> BlockMap [BlockId]
+         -> STUArray s Int Int -> [GenBasicBlock b]
+         -> ST s (SCC (GenBasicBlock b))
+hotOrder freqs entries succs blockScc blks = do
+    -- the blocks reached from outside the SCC and the entries, counted to 2
+    let starts !k [] = return k
+        starts k (blk : rest) = do
+          v <- unsafeRead blockScc (blockIndex freqs (blockId blk))
+          if v .&. 3 == 1 || blockId blk `setMember` entries
+            then if k > 0 then return 2 else starts (1 :: Int) rest
+            else starts k rest
+    ns <- starts 0 blks
+    if ns /= 1 then return (CyclicSCC blks) else do
+      -- the blocks reached from outside the SCC, and the entries, first
+      starts0 <- filterM (\x -> do
+                   let blk = barr ! x
+                   v <- unsafeRead blockScc (blockIndex freqs (blockId blk))
+                   return (v .&. 3 == 1 || blockId blk `setMember` entries))
+                 [0 .. n - 1]
+      let -- each block's position in the SCC, by its index in the CFG
+          posOf = IM.fromList [ (blockIndex freqs (blockId blk), x)
+                              | (x, blk) <- zip [0 ..] blks ]
+          -- a Data.Set on (Down heat, x), over one SCC's blocks: a binary heap
+          -- in an STUArray, as hotFirst's, made the compiler run at most 0.001%
+          -- fewer instructions and allocate at most 0.005% less (T12707 at -O),
+          -- on GHC 10.1.20261108
+          key x = (Down (bucket (blockFreq freqs (blockId (barr ! x)))), x)
+          push a@(!h, !sn) x
+            | x `IS.member` sn = a
+            | otherwise        = (Set.insert (key x) h, IS.insert x sn)
+          loop (h, sn) acc = case Set.minView h of
+            Nothing -> reverse acc
+            Just ((_, x), h') ->
+              let ts = [ y | d <- mapFindWithDefault [] (blockId (barr ! x))
+                                                     succs
+                           , Just y <- [IM.lookup (blockIndex freqs d) posOf] ]
+              in loop (foldl' push (h', sn) ts) (x : acc)
+          order = loop (foldl' push (Set.empty, IS.empty) starts0) []
+      return $ if null order then CyclicSCC blks
+                             else CyclicSCC (map (barr !) order)
+  where
+    n = length blks
+    barr = listArray (0, n - 1) blks :: Array Int (GenBasicBlock b)
 
 {- Note [The first jump into a block fixes its registers]
    ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -605,11 +1135,10 @@ iteration.
    before allocating one of its predecessors, which could lead to
    inconsistent allocations. Make it so a block is only allocated
    if a predecessor has set the "incoming" assignments for the block, or
-   if it's the procedure's entry block.
+   if it is one of the procedure's entry blocks.
 
-   BL 2009/02: Careful. If the assignment for a block doesn't get set for
-   some reason then this function will loop. We should probably do some
-   more sanity checking to guard against this eventuality.
+   A block whose assignment never gets set is dropped: process stops after
+   a round in which it allocates no block.
 -}
 
 process :: forall freeRegs instr. (RegAllocConstraint freeRegs instr)
@@ -644,39 +1173,34 @@ process entry_ids succs block_live =
       = do
           block_assig <- getBlockAssigR
           if isReached entry_ids block_assig id
-            then do b' <- processBlock succs block_live b
+            then do b' <- processBlock True succs block_live b
                     go blocks next_round (b' : accum) True
 
             else do go blocks (b : next_round) accum madeProgress
 
 -- | Whether a block can be allocated now: a jump to it has been allocated,
--- recording the registers it starts with, or it is an entry.
-isReached :: LabelSet -> BlockAssignment freeRegs -> BlockId -> Bool
+-- recording where its live-in vregs are, or it is an entry.
+isReached :: LabelSet -> BlockAssignment -> BlockId -> Bool
 isReached entry_ids block_assig bid
   = isJust (lookupBlockAssignment bid block_assig) || bid `setMember` entry_ids
 
-
--- | Each block's jump targets.
-jumpSuccs :: Instruction instr
-          => [SCC (LiveBasicBlock instr)] -> BlockMap [BlockId]
-jumpSuccs sccs = mapFromList
-  [ (bid, [ d | LiveInstr (Instr i) _ <- instrs, d <- jumpDestsOfInstr i ])
-  | BasicBlock bid instrs <- flattenSCCs sccs ]
 
 -- | Do register allocation on this basic block
 --
 processBlock
         :: RegAllocConstraint freeRegs instr
-        => BlockMap [BlockId]         -- ^ each block's jump targets
+        => Bool                       -- ^ whether the block is in a cycle
+        -> BlockMap [BlockId]         -- ^ each block's jump targets
         -> BlockMap Regs              -- ^ live regs on entry to each basic block
         -> LiveBasicBlock instr         -- ^ block to do register allocation on
         -> RegM freeRegs [NatBasicBlock instr]   -- ^ block with registers allocated
 
-processBlock succs block_live (BasicBlock id instrs)
+processBlock cyclic succs block_live (BasicBlock id instrs)
  = do   -- pprTraceM "processBlock" $ text "" $$ ppr (BasicBlock id instrs)
         initBlock id block_live
         platform <- getPlatform
-        bassig <- getBlockAssigR :: RegM freeRegs (BlockAssignment freeRegs)
+        bassig <- getBlockAssigR
+        RA_Context { rc_acyclicJoins = joins } <- getContextR
         let -- the jump targets' recorded assignments, and for one not yet
             -- reached, those of the blocks it jumps to, up to three jumps on,
             -- in the order a walk of every path first reaches them. The walk
@@ -692,7 +1216,7 @@ processBlock succs block_live (BasicBlock id instrs)
                      -> (LabelMap Int, [RegMap Loc])
             recorded !_ !seen ls [] = (seen, ls)
             recorded depth seen ls (dest : dests)
-              | Just (_, assig) <- lookupBlockAssignment dest bassig
+              | Just assig <- lookupBlockAssignment dest bassig
               = recorded depth seen (assig : ls) dests
               | depth > 0, Just ds <- mapLookup dest succs
               , mapFindWithDefault 0 dest seen < depth
@@ -736,7 +1260,13 @@ processBlock succs block_live (BasicBlock id instrs)
                                , RegVirtual v <- [regWithFormat_reg r]
                                , let u = getUnique v
                                , Just rr <- [lookupFirstUsed u bassig] ]
-        setBlockContextR id locs claims $ mkMoveDests $ listToUFM $
+            -- the vregs live out of the block that it reads, with their last
+            -- reads in it, built when the block first has to spill one or to
+            -- free a register an assignment in rc_jumpLocs holds a vreg in
+            -- ('slotAhead')
+            lastReads = lastReadsIn joins (mapFindWithDefault [] id succs)
+                                    block_live bassig cyclic instrs
+        setBlockContextR id locs claims lastReads $ mkMoveDests $ listToUFM $
           loop_moves
           -- unlike dyingMovesLast's, these moves into real registers include
           -- those of a vreg the block writes again after the move, its later
@@ -752,34 +1282,34 @@ processBlock succs block_live (BasicBlock id instrs)
         return  $ BasicBlock id instrs' : fixups
 
 
--- | Load the freeregs and current reg assignment into the RegM state
---      for the basic block with this BlockId.
+-- | Set up the RegM state for the basic block with this BlockId: its
+--      current reg assignment, and the freeregs on entry to it.
 initBlock :: FR freeRegs
           => BlockId -> BlockMap Regs -> RegM freeRegs ()
 initBlock id block_live
- = do   platform    <- getPlatform
+ = do   init_free   <- rc_initFree <$> getContextR
         block_assig <- getBlockAssigR
-        case lookupBlockAssignment id block_assig of
-                -- no prior info about this block: we must consider
-                -- any fixed regs to be allocated, but we can ignore
-                -- virtual regs (presumably this is part of a loop,
-                -- and we'll iterate again).  The assignment begins
-                -- empty.
-                Nothing
-                 -> do  -- pprTrace "initFreeRegs" (text $ show initFreeRegs) (return ())
-                        case mapLookup id block_live of
-                          Nothing ->
-                            setFreeRegsR    (frInitFreeRegs platform)
-                          Just live ->
-                            setFreeRegsR $ foldl' (flip frAllocateReg) (frInitFreeRegs platform)
-                                                  (nonDetEltsUniqSet $ takeRealRegs $ getRegs live)
-                            -- See Note [Unique Determinism and code generation]
-                        setAssigR       emptyRegMap
-
-                -- load info about register assignments leading into this block.
-                Just (freeregs, assig)
-                 -> do  setFreeRegsR    freeregs
-                        setAssigR       assig
+        let -- the assignment recorded on entry to this block, if a jump to
+            -- it has been allocated, and none otherwise
+            assig     = fromMaybe emptyRegMap
+                                  (lookupBlockAssignment id block_assig)
+            -- The registers free on entry to this block: every allocatable one
+            -- but the real registers live into it and those holding the vregs
+            -- of its assignment. Deriving them from the free registers of the
+            -- block that first jumped here would leave a real register still
+            -- allocated at that jump and not live into this one, R1 above all
+            -- where it is allocatable, allocated until this block writes it and
+            -- that value dies, so that a value it reloads cannot go back to
+            -- that register and the block's jumps may need fixup moves
+            -- (#27981). This relies on liveness listing in block_live every
+            -- real register live into the block: one it missed would be handed
+            -- to a vreg.
+            hold (Loc loc _) fr = foldl' (flip frAllocateReg) fr (regsOfLoc loc)
+            live_free = allocateRealRegs
+                          (mapFindWithDefault noRegs id block_live) init_free
+        setFreeRegsR $ nonDetStrictFoldUFM hold live_free assig
+                         -- See Note [Unique Determinism and code generation]
+        setAssigR assig
 
 
 -- | Do allocation for a sequence of instructions.
@@ -791,21 +1321,22 @@ linearRA
         -> RegM freeRegs
                 ( [instr]                       --   instructions after register allocation
                 , [NatBasicBlock instr])        --   fresh blocks of fixup code.
-linearRA block_live block_id = go [] []
+linearRA block_live block_id = go 0 [] []
   where
-    go :: [instr]                              -- accumulator for instructions already processed.
+    go :: Int                                  -- position of the next instruction in the block.
+       -> [instr]                              -- accumulator for instructions already processed.
        -> [NatBasicBlock instr]                -- accumulator for blocks of fixup code.
        -> [LiveInstr instr]                    -- liveness annotated instructions in this block.
        -> RegM freeRegs
                ( [instr]                       --   instructions after register allocation
                , [NatBasicBlock instr] )       --   fresh blocks of fixup code.
-    go !accInstr !accFixups [] = do
+    go !_ !accInstr !accFixups [] = do
         return ( reverse accInstr               -- instrs need to be returned in the correct order.
                , accFixups )                    -- it doesn't matter what order the fixup blocks are returned in.
 
-    go accInstr accFixups (instr:instrs) = do
-        (accInstr', new_fixups) <- raInsn block_live accInstr block_id instr instrs
-        go accInstr' (new_fixups ++ accFixups) instrs
+    go !i accInstr accFixups (instr:instrs) = do
+        (accInstr', new_fixups) <- raInsn block_live accInstr block_id i instr instrs
+        go (i + 1) accInstr' (new_fixups ++ accFixups) instrs
 
 -- | Do allocation for a single instruction.
 raInsn
@@ -813,23 +1344,28 @@ raInsn
         => BlockMap Regs                         -- ^ map of what vregs are live on entry to each block.
         -> [instr]                              -- ^ accumulator for instructions already processed.
         -> BlockId                              -- ^ the id of the current block, for debugging
+        -> Int                                  -- ^ the position of the instr in the block.
         -> LiveInstr instr                      -- ^ the instr to have its regs allocated, with liveness info.
         -> [LiveInstr instr]                    -- ^ the instructions after it in the block.
         -> RegM freeRegs
                 ( [instr]                       -- new instructions
                 , [NatBasicBlock instr])        -- extra fixup blocks
 
-raInsn _     new_instrs _ (LiveInstr ii Nothing) _
+-- The position is banged where unused, here and in allocateRegsAndSpill, so
+-- that it is passed unboxed: without the bangs the compiler ran 0.39% more
+-- instructions and allocated 0.15% more compiling T3294 at -O0, 0.15% and
+-- 0.053% more at -O and 0.15% and 0.050% more at -O2, on GHC 10.1.20261108.
+raInsn _     new_instrs _ !_ (LiveInstr ii Nothing) _
         | Just n        <- takeDeltaInstr ii
         = do    setDeltaR n
                 return (new_instrs, [])
 
-raInsn _     new_instrs _ (LiveInstr ii@(Instr i) Nothing) _
+raInsn _     new_instrs _ !_ (LiveInstr ii@(Instr i) Nothing) _
         | isMetaInstr ii
         = return (i : new_instrs, [])
 
 
-raInsn block_live new_instrs id (LiveInstr (Instr instr) (Just live)) rest
+raInsn block_live new_instrs id !pos (LiveInstr (Instr instr) (Just live)) rest
  = do
     platform <- getPlatform
     assig    <- getAssigR
@@ -841,11 +1377,37 @@ raInsn block_live new_instrs id (LiveInstr (Instr instr) (Just live)) rest
     -- then we can eliminate the instruction.
     -- (we can't eliminate it if the source register is on the stack, because
     --  we do not want to use one spill slot for different virtual registers)
+    -- Nor do we eliminate it where a jump target of the block whose assignment
+    -- is recorded has dst in a free register other than src's and another
+    -- vreg in src's: the move puts dst there, which the jump would otherwise
+    -- have to swap with that vreg. Where no target has a vreg in src's
+    -- register, the jump moves dst on its own edge, where the move here would
+    -- run on every path out of the block.
+    RA_Context { rc_jumpLocs = locs } <- getContextR
+    freeregs <- getFreeRegsR
+    let wantedElsewhere src dst
+          | null rs   = False
+          | otherwise = not (any (`elem` srcRegs) rs) && any both locs
+          where rs = jumpLocRegs (getUnique dst) locs
+                -- one recorded assignment giving dst a free register and
+                -- another vreg src's
+                both tassig = case lookupUFM_Directly tassig (getUnique dst) of
+                  Just (Loc l _) -> any isFree (regsOfLoc l) && taken tassig
+                  Nothing        -> False
+                taken = anyUFM (\ (Loc l _) -> any (`elem` srcRegs)
+                                                   (regsOfLoc l))
+                srcRegs = case src of
+                  RegReal rr -> [rr]
+                  _ | Just (Loc l _) <- lookupUFM assig src -> regsOfLoc l
+                    | otherwise -> []
+                isFree r = r `elem` frGetFreeRegs (targetClassOfRealReg platform r)
+                                                  freeregs
     case takeRegRegMoveInstr platform instr of
         Just (src,dst)  | Just fmt <- lookupReg src (liveDieRead live),
                           isVirtualReg dst,
                           not (dst `elemUFM` assig),
-                          isRealReg src || isInReg src assig -> do
+                          isRealReg src || isInReg src assig,
+                          not (wantedElsewhere src dst) -> do
            case src of
               RegReal rr -> setAssigR (addToUFM assig dst (Loc (InReg rr) fmt))
                 -- if src is a fixed reg, then we just map dest to this
@@ -869,9 +1431,9 @@ raInsn block_live new_instrs id (LiveInstr (Instr instr) (Just live)) rest
           -}
            return (new_instrs, [])
 
-        _ -> genRaInsn block_live new_instrs id instr rest live
+        _ -> genRaInsn block_live new_instrs id pos instr rest live
 
-raInsn _ _ _ instr _
+raInsn _ _ _ !_ instr _
         = do
             platform <- getPlatform
             let instr' = fmap (pprInstr platform) instr
@@ -913,12 +1475,13 @@ genRaInsn :: forall freeRegs instr.
           => BlockMap Regs
           -> [instr]
           -> BlockId
+          -> Int
           -> instr
           -> [LiveInstr instr]
           -> Liveness
           -> RegM freeRegs ([instr], [NatBasicBlock instr])
 
-genRaInsn block_live new_instrs block_id instr rest live = do
+genRaInsn block_live new_instrs block_id !pos instr rest live = do
 -- pprTraceM "genRaInsn" $ ppr (block_id, instr)
   platform <- getPlatform
   case liveUsage live of { RU read written ->
@@ -961,7 +1524,7 @@ genRaInsn block_live new_instrs block_id instr rest live = do
 
     -- (a), (b) allocate real regs for all regs read by this instruction.
     (r_spills, r_allocd) <-
-        allocateRegsAndSpill True{-reading-} virt_read [] [] virt_read
+        allocateRegsAndSpill True{-reading-} pos virt_read [] [] virt_read
 
     -- (c) save any temporaries which will be clobbered by this instruction
     clobber_saves <- saveClobberedTemps real_written r_dying rest
@@ -989,7 +1552,7 @@ genRaInsn block_live new_instrs block_id instr rest live = do
 
     -- (g) Allocate registers for temporaries *written* (only)
     (w_spills, w_allocd) <-
-        allocateRegsAndSpill False{-writing-} virt_written [] [] virt_written
+        allocateRegsAndSpill False{-writing-} pos virt_written [] [] virt_written
 
     -- (h) Release registers for temps which are written here and not
     -- used again.
@@ -997,8 +1560,12 @@ genRaInsn block_live new_instrs block_id instr rest live = do
 
     let
         -- (i) Patch the instruction
+        -- Strict: squashed_instr and reload_into both evaluate it, and a lazy
+        -- one is a thunk shared between them, built for every instruction,
+        -- which made the compiler allocate 0.53% more compiling T3294 at -O0
+        -- and 0.18% more at -O and -O2, on GHC 10.1.20261108.
         patched_instr :: instr
-        patched_instr
+        !patched_instr
                 = patchRegsOfInstr platform adjusted_instr patchLookup
 
         -- the real register of the last pair whose vreg is x, the written
@@ -1083,6 +1650,13 @@ genRaInsn block_live new_instrs block_id instr rest live = do
 -- releaseRegs
 
 releaseRegs :: FR freeRegs => [Reg] -> RegM freeRegs ()
+-- nothing dies: the state stays as it is, unwritten, each write building a new
+-- RA_State: written here and in saveClobberedTemps where nothing is clobbered,
+-- the compiler allocated 2.3% more compiling T3294 at -O0 and 0.79% and 0.76%
+-- more at -O and -O2, and ran 0.99%, 0.38% and 0.37% more instructions, and
+-- written here alone, it allocated 2.3%, 0.78% and 0.76% more, on GHC
+-- 10.1.20261108
+releaseRegs [] = return ()
 releaseRegs regs = do
   assig <- getAssigR
   free <- getFreeRegsR
@@ -1116,6 +1690,61 @@ releaseRegs regs = do
 --        - clobbered regs are not allocatable.
 --
 
+{- Note [Unique order in the linear allocator]
+   ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+Folds over the assignment visit its vregs in the order of their uniques, which
+compares their tags first and then their numbers. A vreg named in the Cmm keeps
+the unique of its local register, and the local register of an Id keeps the Id's
+unique (idToReg in GHC.StgToCmm.Env), so its tag is that of the pass that made
+the Id. -fobject-determinism renames every local register of StgToCmm's output,
+in the order it visits them, with uniques tagged 'Q', which sort before the
+instruction selector's 'n'. Among the tags that vregs carry are, in their order
+(that renaming replaces 'B', 'g', 'r', 't' and StgToCmm's own 'c'):
+
+* 'B', Ids that CorePrep's eta-expansion makes, such as the arguments of a
+  constructor worker's entry code at -O0;
+* 'H', on i386, the high half of a 64-bit vreg (getHiVirtualRegFromLo in
+  GHC.Platform.Reg);
+* 'T', the temporaries of -fcmm-thread-sanitizer;
+* 'c', StgToCmm's own temporaries, and a .cmm file's own registers;
+* 'g', Ids made from the supply of the STG pipeline's passes (runStgM in
+  GHC.Stg.Pipeline), such as the arguments that unarisation makes for an unboxed
+  sum;
+* 'n', the instruction selector's temporaries, and in a Haskell module the Cmm
+  pipeline's, as for a safe foreign call;
+* 'r', Ids whose uniques come from the name cache, which Tidy draws on for
+  top-level Ids: the register that holds a top-level closure in its own code is
+  one;
+* 't', Ids made from the supplies of CorePrep, CoreToStg and GHC.Stg.EnforceEpt,
+  among them CorePrep's clones of local Ids;
+* 'u', the Cmm pipeline's temporaries in a .cmm file.
+
+With -fobject-determinism the order in a Haskell module is deterministic but for
+the sanitizer's temporaries, which come from a supply the renaming leaves alone
+(Note [Unique Determinism and code generation] in GHC.Types.Unique).
+
+Nothing in the allocator chose this order, but two decisions take it as a
+ranking: allocRegsAndSpill_spill, where no register of the class needed is free,
+evicts a vreg in a register of the class, other than those being allocated
+for the instruction (keep): of those in both a register and their slot, else
+of those in a register only, the first it visits that it counts as read no
+more in the block, else the first it visits, whatever their preferences or
+the x86-64 order of free registers (evicting the last instead about doubles
+the reloads compiling perf/compiler's T3294 at -O0); and saveClobberedTemps
+finds new registers for the values an instruction clobbers in that order, so
+that, of the values a free register would suit, the later ones are spilled
+once those run out. Before ranking the vregs, and whether or not a register
+of the class is free, allocRegsAndSpill_spill gives the vreg being allocated
+the first register that the recorded jump-target assignments (rc_jumpLocs)
+give it, evicting its holder, if the holder is not kept, no instruction left
+in the block reads it, and one of those assignments has it in its slot and
+none in a register ('slotAhead'): a choice that does not depend on the order.
+makeRegMovementGraph lists a jump's moves in that order too, which decides the
+order of joinToTargets' fixup moves and which move of a cycle is made first, by
+a swap or through the stack. The other folds over the assignment do not depend
+on it.
+-}
+
 saveClobberedTemps
         :: forall instr freeRegs.
            (Instruction instr, FR freeRegs)
@@ -1132,28 +1761,34 @@ saveClobberedTemps [] _ _
 saveClobberedTemps clobbered dying rest
  = do
         assig   <- getAssigR
-        (assig',instrs) <- nonDetStrictFoldUFM_DirectlyM maybe_spill (assig,[]) assig
-        setAssigR assig'
-        return $ -- mkComment (text "<saveClobberedTemps>") ++
-                 instrs
---              ++ mkComment (text "</saveClobberedTemps>")
+        -- The fold's order decides which values are spilled: see
+        -- Note [Unique order in the linear allocator]
+        case nonDetStrictFoldUFM_Directly pick [] assig of
+          -- nothing clobbered: the state unwritten, as in releaseRegs (written
+          -- here alone, the compiler allocated 0.16% more compiling T9961 at
+          -- -O0, 0.021% more compiling T12707 at -O and 0.017% more compiling
+          -- !16269's CmmDiamondChain at -O2, on GHC 10.1.20261108)
+          []      -> return []
+          to_save -> do
+            -- in the order of their uniques, as the fold visits them
+            (assig', instrs)
+              <- foldM (\acc (temp, usage) -> clobber temp acc usage)
+                       (assig, []) (reverse to_save)
+            setAssigR assig'
+            return instrs
    where
      -- Unique represents the VirtualReg
      -- Here we separate the cases which we do want to spill from these we don't.
-     maybe_spill :: Unique
-                 -> (RegMap Loc,[instr])
-                 -> Loc
-                 -> RegM freeRegs (RegMap Loc,[instr])
-     maybe_spill !temp !(assig,instrs) !loc =
+     dying_us = map getUnique dying
+     pick :: Unique -> Loc -> [(Unique, RealRegUsage)]
+          -> [(Unique, RealRegUsage)]
+     pick !temp !loc acc =
         case loc of
-                -- This is non-deterministic but we do not
-                -- currently support deterministic code-generation.
-                -- See Note [Unique Determinism and code generation]
                 Loc (InReg reg) fmt
                     | any (realRegsAlias reg) clobbered
-                    , temp `notElem` map getUnique dying
-                    -> clobber temp (assig,instrs) (RealRegUsage reg fmt)
-                _ -> return (assig,instrs)
+                    , temp `notElem` dying_us
+                    -> (temp, RealRegUsage reg fmt) : acc
+                _ -> acc
 
      -- See Note [UniqFM and the register allocator]
      clobber :: Unique -> (RegMap Loc,[instr]) -> RealRegUsage -> RegM freeRegs (RegMap Loc,[instr])
@@ -1177,7 +1812,8 @@ saveClobberedTemps clobbered dying rest
               -- next read; use it to save the
               -- clobbered value.
               free@(_ : _) -> do
-                  my_reg <- firstFreeInOrder temp free
+                  locs <- rc_jumpLocs <$> getContextR
+                  my_reg <- firstFreeInOrder temp (jumpLocRegs temp locs) free
                   setFreeRegsR (frAllocateReg my_reg freeRegs)
 
                   let new_assign = addToUFM_Directly assig temp (Loc (InReg my_reg) fmt)
@@ -1236,10 +1872,9 @@ clobberRegs clobbered
         setFreeRegsR $! frClobberRegs platform clobbered freeregs
 
         assig           <- getAssigR
-        setAssigR $! clobber assig (nonDetUFMToList assig)
-          -- This is non-deterministic but we do not
-          -- currently support deterministic code-generation.
-          -- See Note [Unique Determinism and code generation]
+        setAssigR $! nonDetStrictFoldUFM_Directly clobber assig assig
+          -- Each vreg is updated on its own, so the fold's order does
+          -- not matter (Note [Unique Determinism and code generation])
 
    where
         -- if the temp was InReg and clobbered, then we will have
@@ -1248,16 +1883,12 @@ clobberRegs clobbered
         -- also catches temps which were loaded up during allocation
         -- of read registers, not just those saved in saveClobberedTemps.
 
-        clobber :: RegMap Loc -> [(Unique,Loc)] -> RegMap Loc
-        clobber assig []
-                = assig
-
-        clobber assig ((temp, Loc (InBoth reg slot) regFmt) : rest)
+        clobber :: Unique -> Loc -> RegMap Loc -> RegMap Loc
+        clobber temp (Loc (InBoth reg slot) regFmt) assig
                 | any (realRegsAlias reg) clobbered
-                = clobber (addToUFM_Directly assig temp (Loc (InMem slot) regFmt)) rest
-
-        clobber assig (_:rest)
-                = clobber assig rest
+                = addToUFM_Directly assig temp (Loc (InMem slot) regFmt)
+        clobber _ _ assig
+                = assig
 
 -- -----------------------------------------------------------------------------
 -- allocateRegsAndSpill
@@ -1282,20 +1913,22 @@ data SpillLoc = ReadMem StackSlot Format -- reading from register only in memory
 allocateRegsAndSpill
         :: forall freeRegs instr. (FR freeRegs, Instruction instr)
         => Bool               -- True <=> reading (load up spilled regs)
+        -> Int                -- the position of this instruction in the block
         -> [VirtualRegWithFormat] -- don't push these out
         -> [instr]            -- spill insns
         -> [RealReg]          -- real registers allocated (accum.)
         -> [VirtualRegWithFormat] -- temps to allocate
         -> RegM freeRegs ( [instr] , [RealReg])
 
-allocateRegsAndSpill _       _    spills alloc []
+-- the position banged though unused: see raInsn
+allocateRegsAndSpill _       !_ _    spills alloc []
         = return (spills, reverse alloc)
 
-allocateRegsAndSpill reading keep spills alloc (r@(VirtualRegWithFormat vr vrFmt):rs)
+allocateRegsAndSpill reading !pos keep spills alloc (r@(VirtualRegWithFormat vr vrFmt):rs)
  = do   assig <- toVRegMap <$> getAssigR
         -- pprTraceM "allocateRegsAndSpill:assig" (ppr (r:rs) $$ ppr assig)
         -- See Note [UniqFM and the register allocator]
-        let doSpill = allocRegsAndSpill_spill reading keep spills alloc r rs assig
+        let doSpill = allocRegsAndSpill_spill reading pos keep spills alloc r rs assig
         case lookupUFM assig vr of
                 -- case (1a): already in a register
                 Just (Loc (InReg my_reg) in_reg_fmt) -> do
@@ -1304,7 +1937,7 @@ allocateRegsAndSpill reading keep spills alloc (r@(VirtualRegWithFormat vr vrFmt
                   when (not reading && vrFmt /= in_reg_fmt) $
                     setAssigR $ toRegMap $
                       addToUFM assig vr (Loc (InReg my_reg) vrFmt)
-                  allocateRegsAndSpill reading keep spills (my_reg:alloc) rs
+                  allocateRegsAndSpill reading pos keep spills (my_reg:alloc) rs
 
                 -- case (1b): already in a register (and memory)
                 Just (Loc (InBoth my_reg _) _) -> do
@@ -1315,7 +1948,7 @@ allocateRegsAndSpill reading keep spills alloc (r@(VirtualRegWithFormat vr vrFmt
                   when (not reading) $
                     setAssigR $ toRegMap $
                       addToUFM assig vr (Loc (InReg my_reg) vrFmt)
-                  allocateRegsAndSpill reading keep spills (my_reg:alloc) rs
+                  allocateRegsAndSpill reading pos keep spills (my_reg:alloc) rs
 
                 -- Not already in a register, so we need to find a free one...
                 Just (Loc (InMem slot) memFmt)
@@ -1361,41 +1994,80 @@ from which 'firstFreeInOrder' takes the first that is free:
    value live into the block that recorded it reaches none of the blocks this
    value reaches either: there it comes after the wide destination.
 
+ * For a variable whose wide destination, below, is propagated from another
+   variable it is moved into where it dies, the register that variable has in
+   its first assignment: the propagated destination is where that variable
+   goes later, such as a loop variable at the loop's exit, and its first
+   assignment where it is, such as at the loop's head.
+
  * The real register a block the variable is live into moves it into where it
-   dies, such as R1 for a value evaluated some blocks after it is computed,
-   unless that register is live together with the variable somewhere, as
-   wideMoveDests counts it, or, on x86-64, the block follows a failed heap or
-   stack check. It is left out also where another variable the current block
-   reads or writes, with no location yet, has it as its first-used register.
+   dies, such as R1 for a value evaluated some blocks after it is computed, or,
+   for a variable moved where it dies into another variable that has such a
+   register, up to four such moves back, that register, so that the value is
+   computed where it goes; unless that register is live together with the
+   variable somewhere, as wideMoveDests counts it, or, on x86-64, the block
+   follows a failed heap or stack check. It is left out also where another
+   variable the current block reads or writes, with no location yet, has it as
+   its first-used register.
 
 Preferring every register the variable was assigned to, not only the first, was
 tried and turned out to barely matter.
 
-Where none of them is free, the first free register is taken, those the current
-block moves another virtual register into where it dies coming last: a variable
+The fallback below leaves out, where others remain, the free registers the
+current block moves another virtual register into where it dies: a variable
 given one would keep the other from being computed in it, or have to move out of
 its way.
+
+On x86-64 the fallback also leaves out, where others remain, the free registers
+that the blocks up to three jumps ahead that the variable is live into move
+another virtual register into where it dies, the variable's own such
+destinations excepted: given one, the variable would keep the other from
+being computed in it, or have to move out of its way there (IntMap's union
+and fromAscList in containers' benchmarks). Not for a variable live across
+a C call, which leaves its register at the call anyway: a block after the
+call, such as k-nucleotide's copy of a new key, would put it on an argument
+register that the call's own setup needs. Nor where a jump target not yet
+recorded that it is live into has other predecessors, those after a failed
+heap or stack check not counted: its register there binds them all, and
+a walk from one of them reaching a rare exit put megaparsec's manyTill
+counter on a register its hot predecessor holds.
+
+Where none of them is free, the allocator takes a free register: the first, and
+on x86-64 ('fallbackReg') the first in this order: first those no instruction
+writes while the virtual register is live past the write, such as %r14 and %rbx
+for a value live across a C call on System V, so that the value need not move
+out of their way; and among those, as among the rest, R1's register, %rbx, last,
+as an evaluation and a return write it: a value given it may have to move out of
+their way, and a loop variable given it at the loop's entry moves at every
+iteration (#27981). On x86-64, for a virtual register with preferences, the free
+registers that a jump target's recorded assignment gives any virtual register
+are left out where others remain, its own there being among its preferences.
+This applies to the fallback only: a free preferred register is taken even where
+a recorded jump target gives it to another virtual register, as leaving those
+out too made more join fixups cyclic and cost containers 0.13% and vector 0.11%
+more instructions (nofib's puzzle 2.7%). Leaving them out for one with no
+preferences too gains nothing measured and costs compile time, the list of
+registers to leave out then being built for every such allocation.
 -}
 
 -- | Of the given free registers of a class, the one to take for the
--- virtual register with the given unique: the first of its preferred
+-- virtual register with the given unique, given its registers in the jump
+-- targets' assignments ('jumpLocRegs'): the first of its preferred
 -- registers, best first, that is free, else the first free one in the order
 -- Note [Register preferences in the linear allocator] gives.
-firstFreeInOrder :: Unique -> [RealReg] -> RegM freeRegs RealReg
-firstFreeInOrder _ [] = panic "firstFreeInOrder: no free register"
-firstFreeInOrder u free@(r0 : _) = do
-  bassig <- getBlockAssigR :: RegM freeRegs (BlockAssignment freeRegs)
+firstFreeInOrder :: Unique -> [RealReg] -> [RealReg] -> RegM freeRegs RealReg
+firstFreeInOrder u !jl free = do
+  bassig <- getBlockAssigR
   cur <- getAssigR :: RegM freeRegs (RegMap Loc)
-  RA_Context { rc_jumpLocs  = locs
-             , rc_moveDests = MoveDests moves allMoved movedTwice
-             , rc_claims    = claims
-             , rc_wideDests = wide
-             , rc_block     = blk
-             , rc_succs     = succs
-             , rc_live      = live
-             , rc_dying     = dying } <- getContextR
-  let !jl = jumpLocRegs u locs
-      mv = lookupUFM_Directly moves u
+  ctx@RA_Context { rc_moveDests = MoveDests moves allMoved movedTwice
+                 , rc_claims    = claims
+                 , rc_wideDests = wide
+                 , rc_via       = via
+                 , rc_block     = blk
+                 , rc_succs     = succs
+                 , rc_live      = live
+                 , rc_dying     = dying } <- getContextR
+  let mv = lookupUFM_Directly moves u
       !firstUsed = lookupFirstUsed u bassig
       -- the wide destination, where it and the first-used register differ,
       -- both are free and no other vreg of the block claims it (claimed),
@@ -1409,6 +2081,11 @@ firstFreeInOrder u free@(r0 : _) = do
       stale = case firstUsed of
              Just r0
                | Just w <- lookupUFM_Directly wide u, w /= r0, isFree w, isFree r0
+               -- (the walk skipped where a jump target's register other than w
+               -- is free and taken: without this the compiler allocated 0.012%
+               -- more compiling T783 at -O0 and 0.008% more compiling !16269's
+               -- CmmDiamondChain at -O and -O2, on GHC 10.1.20261108)
+               , maybe True (== w) found
                , not (claimed w)
                , (True, Nothing, region) <- staleWalk u live succs bassig (succsOf blk)
                , any (movesInto w) (setElems region)
@@ -1426,7 +2103,7 @@ firstFreeInOrder u free@(r0 : _) = do
              Just r0
                | isStaleFirst u bassig
                , (True, Just b, region) <- staleWalk u live succs bassig (succsOf blk)
-               , Just (_, assig) <- lookupBlockAssignment b bassig
+               , Just assig <- lookupBlockAssignment b bassig
                , Just (Loc l _) <- lookupUFM_Directly assig u
                , r : _ <- regsOfLoc l, r /= r0, isFree r
                , not (any (meets (setInsert b region)) (blocksHolding u r0 bassig))
@@ -1434,11 +2111,11 @@ firstFreeInOrder u free@(r0 : _) = do
              _ -> Nothing
       -- the first-used register, but none where stale gives a register,
       -- and reached's where it gives one
-      fu | isJust stale   = Nothing
-         | isJust reached = reached
-         | otherwise      = firstUsed
+      !fu | isJust stale   = Nothing
+          | isJust reached = reached
+          | otherwise      = firstUsed
       movesInto w b = case mapLookup b dying of
-        Just ds -> lookupUFM_Directly ds u == Just w
+        Just (DyingMoves _ ds) -> lastDest u ds == Just w
         Nothing -> False
       meets = staleMeets u live succs bassig
       succsOf b = mapFindWithDefault [] b succs
@@ -1464,22 +2141,202 @@ firstFreeInOrder u free@(r0 : _) = do
         Just (RealRegSingle n)
           | not (testBit movedTwice n) -> clearBit allMoved n
         _                              -> allMoved
-      chosen = case find isFree jl of
-                 Nothing -> pick mv (pick fu wdFree)
-                 found   -> found
+      -- (the list itself where the block moves no other vreg: filtered there
+      -- too, it made the compiler run 0.17% more instructions and allocate
+      -- 0.37% more compiling T3294 at -O0, 0.091% and 0.17% more at -O and
+      -- 0.090% and 0.17% more at -O2, on GHC 10.1.20261108)
+      free' | others == 0 = free
+            | otherwise   = case filter (\(RealRegSingle n) -> not (testBit others n)) free of
+                              [] -> free
+                              fs -> fs
+      noPrefs = null jl && isNothing mv && isNothing fu
+                && maybe True claimed (lookupUFM_Directly wide u)
+      -- for a vreg whose wide destination is propagated from a vreg it is
+      -- moved into where it dies, that vreg's first-used register where it is
+      -- free: the propagated destination is where that vreg goes later, its
+      -- first-used register where it is
+      viaFree = case lookupUFM_Directly via u of
+                  Just y | isJust (lookupUFM_Directly wide u)
+                         , Just r <- lookupFirstUsed (getUnique y) bassig
+                         , isFree r
+                         -> Just r
+                  _      -> Nothing
+      -- the first of the jump targets' registers that is free
+      found = find isFree jl
+      chosen = case found of
+                 Nothing -> pick mv (pick fu (pick viaFree wdFree))
+                 _       -> found
   case stale of
     Just w | chosen == Just w -> setBlockAssigR (markStaleFirst u bassig)
     _                         -> return ()
   return $! case chosen of
-    Just r -> r
-    -- (the first free register itself where the block moves no other vreg:
-    -- filtered there too, the free registers made the compiler run 0.15% more
-    -- instructions and allocate 0.32% more compiling T3294 at -O0 when this
-    -- was added)
-    Nothing | others == 0 -> r0
-            | otherwise   -> case filter (\(RealRegSingle n) -> not (testBit others n)) free of
-                               r : _ -> r
-                               []    -> r0
+    Just r  -> r
+    Nothing -> case rc_clobbers ctx of
+      Just clobbers -> fallbackReg ctx clobbers bassig noPrefs u free'
+      Nothing       -> case free' of
+        r : _ -> r
+        []    -> panic "firstFreeInOrder: no free register"
+
+-- | On x86-64, of the given free registers, the one 'firstFreeInOrder' takes
+-- for the virtual register with the given unique where none of its preferences
+-- is free, given regClobbers' map ('rc_clobbers'), the block assignment
+-- and whether it has none: the first in the order
+-- Note [Register preferences in the linear allocator] gives.
+fallbackReg :: RA_Context freeRegs -> UniqFM VirtualReg Word64
+            -> BlockAssignment -> Bool -> Unique -> [RealReg] -> RealReg
+fallbackReg RA_Context { rc_jumpLocs = locs, rc_block = blk, rc_succs = succs
+                       , rc_joins = joins, rc_live = live, rc_dying = dying }
+            clobbers bassig noPrefs u free@(r0 : _)
+  = let !r1 = r1Reg
+        !cl = lookupWithDefaultUFM_Directly clobbers 0 u
+        kept (RealRegSingle n) = not (testBit cl n)
+        -- the free ones to choose from: for one with preferences, those no jump
+        -- target's assignment gives a virtual register if any remain, and all
+        -- of them otherwise
+        fs | noPrefs   = free
+           | otherwise = case filter unreserved free of
+                           []  -> free
+                           fs' -> fs'
+        -- and of those, the ones the blocks up to three jumps ahead do not
+        -- move another vreg into where it dies while the vreg is live into
+        -- them, if any remain: given one, the vreg would keep that one from
+        -- being computed in it, or have to move out of its way. Not for a vreg
+        -- live across a C call, which leaves its register there anyway, nor
+        -- where a jump target not yet recorded that the vreg is live into has
+        -- other predecessors, which then have to give it the same register
+        !ahead | cl .&. cCallClobbers == cCallClobbers = 0
+               | otherwise = movedAhead
+        !wanted = ahead .&. complement (ahead `shiftR` 32)
+        ok (RealRegSingle n) = not (testBit wanted n)
+        joinNext = any (\b -> b `setMember` joins && liveInto u live b
+                              && isNothing (lookupBlockAssignment b bassig))
+                       (succsOf blk)
+        -- the real registers that the blocks up to three jumps ahead of the
+        -- current one, those the vreg is live into, move vregs into where they
+        -- die, as bits by register number, and above them, shifted by 32, those
+        -- they move the vreg itself into (three jumps, bounding the walk,
+        -- is arbitrary, and may be raised where a case needs more at little
+        -- cost to the compiler: lifted to 1000, compiling 50 to 400 loops in
+        -- sequence ran 1.01 to 1.11 times the instructions, the excess growing
+        -- as N squared)
+        movedAhead :: Word64
+        movedAhead = fst (aheadWalks u live succs dying 3 0 mapEmpty
+                                     (succsOf blk))
+        succsOf b = mapFindWithDefault [] b succs
+        unreserved (RealRegSingle n) = not (testBit reserved n)
+        reserved = foldl' (\b (RealRegSingle n) -> setBit b n) (0 :: Word64)
+                     [ r | assig <- locs, Loc loc _ <- nonDetEltsUFM assig
+                         , r <- regsOfLoc loc ]
+        -- those no instruction writes while the vreg is live past it, then the
+        -- rest, R1's last in each part
+        part p = [ r | r <- fs, p r, r /= r1 ] ++ [ r1 | r1 `elem` fs, p r1 ]
+        -- INLINE so that the lists fuse: let-bound and used more than once,
+        -- part is otherwise not inlined and builds both lists, which made the
+        -- compiler allocate 0.66% more compiling T3294 at -O0, 0.22% more at -O
+        -- and 0.21% more at -O2, on GHC 10.1.20261108
+        {-# INLINE part #-}
+        -- The choice stays the list's own box, not a new one per call. So
+        -- r /= r1 comes last in part: tested first, against a literal, it
+        -- leaves the element to be rebuilt. And rd is returned under lazy:
+        -- the result being a small product, demand analysis would otherwise
+        -- unbox rd (Note [Unboxed demand on function bodies returning small
+        -- products] in GHC.Core.Opt.DmdAnal), and worker/wrapper box it anew.
+        -- Together they save 0.070% of T3294's compile allocation at -O0,
+        -- 0.023% at -O and 0.022% at -O2, on GHC 10.1.20261108; neither alone
+        -- saved any at -O0, on GHC 10.1.20261103.
+        rd = fromMaybe r0 (listToMaybe (part kept ++ part (not . kept)))
+    in if ok rd then lazy rd
+       else case listToMaybe (part (\r -> ok r && kept r)
+                              ++ part (\r -> ok r && not (kept r))) of
+              Just r | not joinNext -> r
+              _                     -> lazy rd
+fallbackReg _ _ _ _ _ [] = panic "fallbackReg: no free register"
+
+-- | R1's register on x86-64, which an evaluation and a return write.
+r1Reg :: RealReg
+r1Reg = fromMaybe (panic "r1Reg: R1 has no register")
+                  (X86_64.globalRegMaybe (VanillaReg 1))
+
+-- | The registers of x86-64 that a C call writes on both System V and Windows,
+-- rax, rcx, rdx and r8 to r11, as bits by register number: a vreg whose
+-- clobbering writes include all of them is live across a C call.
+cCallClobbers :: Word64
+cCallClobbers = foldl' setBit 0 [0, 2, 3, 8, 9, 10, 11]
+
+-- | fallbackReg's walk: from the given blocks, up to the given number
+-- of jumps, through the blocks the vreg with the given unique is live into,
+-- the registers their moves into real registers where vregs die go to, as bits
+-- by register number, and above them, shifted by 32, those of the vreg's own
+-- such moves, or'ed into the given ones. The walk keeps, beside them, for each
+-- block it walks on from with two jumps or more left, the most jumps it had
+-- left there, set before that walk, and walks on from the block again only
+-- with more: a walk with fewer jumps reaches only blocks the walk with more
+-- reaches, and or'ing is idempotent and commutative, so the result is the
+-- same, and a block is walked on from with two jumps or more left at most once
+-- for each number of them, not once for each path to it, whose number grows
+-- exponentially with the jumps. Top-level: local to fallbackReg, the walk made
+-- the compiler allocate 0.18% more compiling T3294 at -O0, 0.059% more at -O
+-- and 0.055% more at -O2, on GHC 10.1.20261108.
+aheadWalks :: Unique -> BlockMap Regs -> LabelMap [BlockId]
+           -> LabelMap DyingMoves
+           -> Int -> Word64 -> LabelMap Int -> [BlockId]
+           -> (Word64, LabelMap Int)
+aheadWalks !_ _ _ _ !_ !acc !seen [] = (acc, seen)
+aheadWalks u live succs dying d acc seen (b : bs)
+  | not (liveInto u live b) = aheadWalks u live succs dying d acc seen bs
+  | otherwise
+  = let !acc' = case mapLookup b dying of
+                  Just (DyingMoves m ds) -> acc .|. m .|. lastDestBit u ds
+                  Nothing                -> acc
+    in if d <= 1 || mapFindWithDefault 0 b seen >= d
+       then aheadWalks u live succs dying d acc' seen bs
+       else case aheadWalks u live succs dying (d - 1) acc'
+                            (if d > 2 then mapInsert b d seen else seen)
+                            (mapFindWithDefault [] b succs) of
+              (acc'', seen') -> aheadWalks u live succs dying d acc'' seen' bs
+
+-- | The blocks that two blocks or more jump to, the jumps from the given
+-- blocks not counted (on x86-64, those that follow a failed heap or stack
+-- check).
+joinBlocks :: LabelSet -> BlockMap [BlockId] -> LabelSet
+joinBlocks cold js = jumpedToTwice (\b -> not (b `setMember` cold)) js
+
+-- | The blocks that two blocks or more of those passing the test jump to
+jumpedToTwice :: (BlockId -> Bool) -> BlockMap [BlockId] -> LabelSet
+jumpedToTwice from js = case mapFoldlWithKey step (Seen setEmpty setEmpty) js of
+  Seen _ twice -> twice
+  where
+    step seen b ds
+      | from b    = targets seen [] ds
+      | otherwise = seen
+    -- each block's targets counted once, those it jumps to twice included
+    targets seen _ [] = seen
+    targets seen@(Seen once twice) prev (d : more)
+      | d `elem` prev      = targets seen prev more
+      | d `setMember` once = targets (Seen once (setInsert d twice)) (d : prev) more
+      | otherwise          = targets (Seen (setInsert d once) twice) (d : prev) more
+{-# INLINE jumpedToTwice #-}
+
+-- | The blocks jumped to by some block, and by two or more.
+data Seen = Seen !LabelSet !LabelSet
+
+-- | The block's moves into real registers where vregs die, added to the map
+-- where it has any.
+dyingIn :: Instruction instr => Platform -> LabelMap DyingMoves
+        -> LiveBasicBlock instr -> LabelMap DyingMoves
+dyingIn platform acc (BasicBlock b instrs)
+  = case [ (vr, rr) | (vr, RegReal rr) <- dyingMoves platform instrs ] of
+      []  -> acc
+      ms  -> mapInsert b (DyingMoves (foldl' (\m (_, RealRegSingle n) -> setBit m n) 0 ms) ms) acc
+
+-- | The register of the last of the moves given that moves the vreg with the
+-- given unique, as 'listToUFM' keeps a vreg's last entry.
+lastDest :: Unique -> [(VirtualReg, RealReg)] -> Maybe RealReg
+lastDest u = foldl' (\acc (v, r) -> if getUnique v == u then Just r else acc) Nothing
+
+-- | As 'lastDest', the register as a bit above 32 by its number, or 0.
+lastDestBit :: Unique -> [(VirtualReg, RealReg)] -> Word64
+lastDestBit u ds = maybe 0 (\(RealRegSingle n) -> bit (n + 32)) (lastDest u ds)
 
 -- | What 'liveWalk' does at a block: stop with a result, take the block
 -- without its successors, or take it and queue them.
@@ -1517,7 +2374,7 @@ liveWalk !u live succs atEnd atCap visit start = go (0 :: Int) setEmpty start []
 -- !16269's CmmDiamondChain at -O0 and 0.023% more at -O and -O2, on GHC
 -- 10.1.20261108.
 staleWalk :: Unique -> BlockMap Regs -> LabelMap [BlockId]
-          -> BlockAssignment freeRegs -> [BlockId] -> (Bool, Maybe BlockId, LabelSet)
+          -> BlockAssignment -> [BlockId] -> (Bool, Maybe BlockId, LabelSet)
 {-# NOINLINE staleWalk #-}
 staleWalk u live succs bassig
   = liveWalk u live succs (\seen -> (True, Nothing, seen))
@@ -1531,7 +2388,7 @@ staleWalk u live succs bassig
 -- fb reaches a block of the region, by 'liveWalk' from fb, going no further
 -- than the other recorded blocks and giving up as 'staleWalk' does.
 staleMeets :: Unique -> BlockMap Regs -> LabelMap [BlockId]
-           -> BlockAssignment freeRegs -> LabelSet -> BlockId -> Bool
+           -> BlockAssignment -> LabelSet -> BlockId -> Bool
 {-# NOINLINE staleMeets #-}
 staleMeets u live succs bassig region fb
   = liveWalk u live succs (const False) (const True) visit [fb]
@@ -1540,10 +2397,6 @@ staleMeets u live succs bassig region fb
       | b `setMember` region                              = Done True
       | b /= fb, Just _ <- lookupBlockAssignment b bassig = Skip
       | otherwise                                         = Expand
-
--- | Whether the vreg with the given unique is live into the block.
-liveInto :: Unique -> BlockMap Regs -> BlockId -> Bool
-liveInto !u live b = elemUniqSet_Directly u (getRegs (mapFindWithDefault noRegs b live))
 
 -- | 'jumpLocRegs' u locs: the registers the recorded jump-target assignments
 -- locs give the virtual register with unique u, in order.
@@ -1562,6 +2415,7 @@ jumpLocRegs u locs = foldr at [] locs
 -- convenient and it maintains the recursive structure of the allocator. -- EZY
 allocRegsAndSpill_spill :: (FR freeRegs, Instruction instr)
                         => Bool
+                        -> Int
                         -> [VirtualRegWithFormat]
                         -> [instr]
                         -> [RealReg]
@@ -1570,16 +2424,52 @@ allocRegsAndSpill_spill :: (FR freeRegs, Instruction instr)
                         -> UniqFM VirtualReg Loc
                         -> SpillLoc
                         -> RegM freeRegs ([instr], [RealReg])
-allocRegsAndSpill_spill reading keep spills alloc r@(VirtualRegWithFormat vr vrFmt) rs assig spill_loc
+allocRegsAndSpill_spill reading !pos keep spills alloc r@(VirtualRegWithFormat vr vrFmt) rs assig spill_loc
  = do   platform <- getPlatform
         freeRegs <- getFreeRegsR
+        RA_Context { rc_lastReads = lastReads, rc_jumpLocs = locs } <- getContextR
         let regclass = classOfVirtualReg (platformArch platform) vr
             freeRegs_thisClass = frGetFreeRegs regclass freeRegs :: [RealReg]
+            -- the vreg's registers in the jump targets' assignments, computed
+            -- once for the guard below and firstFreeInOrder
+            jl = jumpLocRegs (getUnique vr) locs
+            -- the register w of the vreg in an assignment in rc_jumpLocs taken
+            -- from temp, at l in it, which goes to its slot ('slotAhead' below)
+            ahead w temp l old_fmt = case l of
+                InBoth _ slot -> evicted w temp old_fmt [] slot
+                _             -> do
+                  (spill_store, slot) <- spillR (RegWithFormat (RegReal w) old_fmt) temp
+                  recordSpill (SpillAlloc temp)
+                  evicted w temp old_fmt spill_store slot
+            -- the register w taken from temp, in slot once spill_store has run,
+            -- for the vreg, at its format rather than temp's (#26542)
+            {-# INLINE evicted #-}
+            evicted w temp old_fmt spill_store slot = do
+                let assig1 = addToUFM_Directly assig temp $ Loc (InMem slot) old_fmt
+                    assig2 = addToUFM assig1 vr $! newLocation spill_loc (RealRegUsage w vrFmt)
+                setAssigR $ toRegMap assig2
+                spills' <- loadTemp r spill_loc w spills
+                allocateRegsAndSpill reading pos keep (spill_store ++ spills') (w : alloc) rs
 
         case freeRegs_thisClass of
          -- case (2): we have a free register
+         _ : _
+           -- unless an assignment in rc_jumpLocs has the vreg in a register
+           -- held by one the block reads no more, one such assignment having
+           -- that one in its slot and none in a register ('slotAhead'): that
+           -- one goes to its slot here rather than on the way there, and the
+           -- vreg takes its register, as it would have to on the way
+           | w : _ <- jl
+           , w `notElem` freeRegs_thisClass
+           , targetClassOfRealReg platform w == regclass
+           , Just (temp, Loc l old_fmt) <- occupant w assig
+           , notKept temp (map (getUnique . virtualRegWithFormat_reg) keep)
+           , slotAhead lastReads locs pos temp
+           -> ahead w temp l old_fmt
+
          _ : _ ->
-           do   final_reg <- firstFreeInOrder (getUnique vr) freeRegs_thisClass
+           do   final_reg <- firstFreeInOrder (getUnique vr) jl
+                                                  freeRegs_thisClass
 
                 spills'   <- loadTemp r spill_loc final_reg spills
 
@@ -1587,57 +2477,114 @@ allocRegsAndSpill_spill reading keep spills alloc r@(VirtualRegWithFormat vr vrF
                           $ (addToUFM assig vr $! newLocation spill_loc $ RealRegUsage final_reg vrFmt)
                 setFreeRegsR $  frAllocateReg final_reg freeRegs
 
-                allocateRegsAndSpill reading keep spills' (final_reg : alloc) rs
+                allocateRegsAndSpill reading pos keep spills' (final_reg : alloc) rs
 
 
           -- case (3): we need to push something out to free up a register
          [] ->
-           do   let inRegOrBoth (InReg _) = True
-                    inRegOrBoth (InBoth _ _) = True
-                    inRegOrBoth _ = False
-                let candidates' :: UniqFM VirtualReg Loc
-                    candidates' =
-                      flip delListFromUFM (fmap virtualRegWithFormat_reg keep) $
-                      filterUFM (inRegOrBoth . locWithFormat_loc) $
-                      assig
-                      -- This is non-deterministic but we do not
-                      -- currently support deterministic code-generation.
-                      -- See Note [Unique Determinism and code generation]
-                let candidates = nonDetUFMToList candidates'
-
-                -- the vregs we could kick out that are already in a slot
-                let compat reg'
+           do   let compat reg'
                       =  targetClassOfRealReg platform reg'
                       == regclass
-                    candidates_inBoth :: [(Unique, RealRegUsage, StackSlot)]
-                    candidates_inBoth
-                        = [ (temp, RealRegUsage reg fmt, mem)
-                          | (temp, Loc (InBoth reg mem) fmt) <- candidates
-                          , compat reg ]
-
-                -- the vregs we could kick out that are only in a reg
-                --      this would require writing the reg to a new slot before using it.
-                let candidates_inReg
-                        = [ (temp, RealRegUsage reg fmt)
-                          | (temp, Loc (InReg reg) fmt) <- candidates
-                          , compat reg ]
+                    keep_us = map (getUnique . virtualRegWithFormat_reg) keep
+                    evictable temp reg = compat reg && notKept temp keep_us
+                    -- the first vreg we could kick out that is already in
+                    -- a slot, and the first that is only in a reg, which
+                    -- would require writing the reg to a new slot before
+                    -- using it
+                    pick temp (Loc l fmt) acc@(both, only) = case l of
+                      InBoth reg mem
+                        | Nothing <- both, evictable temp reg
+                        -> (Just (temp, RealRegUsage reg fmt, mem), only)
+                      InReg reg
+                        | Nothing <- only, evictable temp reg
+                        -> (both, Just (temp, RealRegUsage reg fmt))
+                      _ -> acc
+                    -- of the vregs we could kick out that are already in
+                    -- a slot, the first that no instruction left in the block
+                    -- reads, else the first; and of those only in a reg, the
+                    -- same, sought only while none of the first kind has been
+                    -- found, which would be chosen instead. One live into a
+                    -- jump target with no recorded assignment that other
+                    -- blocks jump to as well counts as read again: evicted,
+                    -- it would be in its slot in the assignment this block
+                    -- records, so that every later jump there stores it and
+                    -- the code after the join reloads it ('intoUnrecorded');
+                    -- not where the block or the join is in a cycle, a loop's
+                    -- head then recording what the loop keeps in registers
+                    -- whether a vreg of the class is live out of the block,
+                    -- as one evicted by the guard of `result` below is
+                    lo = liveOutClass (platformArch platform) lastReads regclass
+                    readNoMore temp = not (readLeft lastReads pos temp)
+                                      && not (intoUnrecorded lastReads temp)
+                    pickRead temp (Loc l fmt) acc@(both, only) = case l of
+                      InBoth reg mem -> case both of
+                        NoCand
+                          | evictable temp reg
+                          -> if readNoMore temp
+                               then (ReadNoMore (temp, RealRegUsage reg fmt, mem), only)
+                               else (ReadAgain (temp, RealRegUsage reg fmt, mem), only)
+                        ReadAgain _
+                          | evictable temp reg
+                          , readNoMore temp
+                          -> (ReadNoMore (temp, RealRegUsage reg fmt, mem), only)
+                        _ -> acc
+                      InReg reg -> case only of
+                        NoCand
+                          | evictable temp reg
+                          -> case both of
+                               NoCand
+                                 | readNoMore temp
+                                 -> (both, ReadNoMore (temp, RealRegUsage reg fmt))
+                               _ -> (both, ReadAgain (temp, RealRegUsage reg fmt))
+                        ReadAgain _
+                          | NoCand <- both
+                          , evictable temp reg
+                          , readNoMore temp
+                          -> (both, ReadNoMore (temp, RealRegUsage reg fmt))
+                        _ -> acc
+                      _ -> acc
+                    -- The fold's order picks the victim: see
+                    -- Note [Unique order in the linear allocator]. Only a vreg
+                    -- live out of the block can be read no more in it, so
+                    -- where none of the class is, the first of each kind is
+                    -- chosen, by `pick`, which does not build the map of
+                    -- last-read positions in the block's LastReads: by pickRead
+                    -- there too, the compiler ran 3.7% more instructions and
+                    -- allocated 0.21% more compiling T3294 at -O0, 1.8% and
+                    -- 0.11% more at -O and 1.8% and 0.10% more at -O2, on GHC
+                    -- 10.1.20261108.
+                    (victim_inBoth, victim_inReg)
+                      | lo
+                      , (cand_inBoth, cand_inReg)
+                          <- nonDetStrictFoldUFM_Directly pickRead
+                                                         (NoCand, NoCand) assig
+                      = (candidate cand_inBoth, candidate cand_inReg)
+                      | otherwise
+                      = nonDetStrictFoldUFM_Directly pick (Nothing, Nothing)
+                                                     assig
 
                 let result
 
+                        -- as in case (2), where an assignment in rc_jumpLocs
+                        -- has the vreg in a register held by one the block
+                        -- reads no more ('slotAhead'), live out of it
+                        | lo
+                        , w : _ <- jumpLocRegs (getUnique vr) locs
+                        , targetClassOfRealReg platform w == regclass
+                        , Just (temp, Loc l old_fmt) <- occupant w assig
+                        , notKept temp keep_us
+                        , slotAhead lastReads locs pos temp
+                        = ahead w temp l old_fmt
+
                         -- we have a temporary that is in both register and mem,
                         -- just free up its register for use.
-                        | (temp, (RealRegUsage cand_reg old_fmt), slot) : _ <- candidates_inBoth
-                        = do    spills' <- loadTemp r spill_loc cand_reg spills
-                                let assig1  = addToUFM_Directly assig temp $ Loc (InMem slot) old_fmt
-                                let assig2  = addToUFM assig1 vr $! newLocation spill_loc (RealRegUsage cand_reg vrFmt)
-
-                                setAssigR $ toRegMap assig2
-                                allocateRegsAndSpill reading keep spills' (cand_reg:alloc) rs
+                        | Just (temp, (RealRegUsage cand_reg old_fmt), slot) <- victim_inBoth
+                        = evicted cand_reg temp old_fmt [] slot
 
                         -- otherwise, we need to spill a temporary that currently
                         -- resides in a register.
-                        | (temp_to_push_out, RealRegUsage cand_reg old_reg_fmt) : _
-                                        <- candidates_inReg
+                        | Just (temp_to_push_out, RealRegUsage cand_reg old_reg_fmt)
+                                        <- victim_inReg
                         = do
                                 -- Spill what's currently in the register, with the format of what's in the register.
                                 (spill_store, slot) <- spillR (RegWithFormat (RegReal cand_reg) old_reg_fmt) temp_to_push_out
@@ -1645,20 +2592,7 @@ allocRegsAndSpill_spill reading keep spills alloc r@(VirtualRegWithFormat vr vrF
                                 -- record that this temp was spilled
                                 recordSpill (SpillAlloc temp_to_push_out)
 
-                                -- Update the register assignment:
-                                --  - the old data is now only in memory,
-                                --  - the new data is now allocated to this register;
-                                --    make sure to use the new format (#26542)
-                                let assig1  = addToUFM_Directly assig temp_to_push_out $ Loc (InMem slot) old_reg_fmt
-                                let assig2  = addToUFM assig1 vr $! newLocation spill_loc (RealRegUsage cand_reg vrFmt)
-                                setAssigR $ toRegMap assig2
-
-                                -- if need be, load up a spilled temp into the reg we've just freed up.
-                                spills' <- loadTemp r spill_loc cand_reg spills
-
-                                allocateRegsAndSpill reading keep
-                                        (spill_store ++ spills')
-                                        (cand_reg:alloc) rs
+                                evicted cand_reg temp_to_push_out old_reg_fmt spill_store slot
 
 
                         -- there wasn't anything to spill, so we're screwed.
@@ -1675,6 +2609,125 @@ allocRegsAndSpill_spill reading keep spills alloc r@(VirtualRegWithFormat vr vrF
 
                 result
 
+
+-- | allocRegsAndSpill_spill's choice among the vregs of one kind, those in both
+-- a register and their slot or those in a register only, as its fold over the
+-- assignment goes: none yet; the first, where each so far counts as read again
+-- or the kind is no longer sought; or the first that counts as read no more
+-- (its `readNoMore`).
+data Cand a = NoCand | ReadAgain a | ReadNoMore a
+
+candidate :: Cand a -> Maybe a
+candidate NoCand         = Nothing
+candidate (ReadAgain a)  = Just a
+candidate (ReadNoMore a) = Just a
+
+-- | A block's 'LastReads', given the procedure's joins outside cycles
+-- ('rc_acyclicJoins'), its jump targets, the recorded assignments and whether
+-- the block is in a cycle.
+lastReadsIn :: LabelSet -> [BlockId] -> BlockMap Regs -> BlockAssignment -> Bool
+            -> [LiveInstr instr] -> LastReads
+lastReadsIn joins dests block_live bassig cyclic instrs
+  = LastReads (go 0 emptyUFM instrs) outs joinOuts
+  where
+    outs = [ mapFindWithDefault noRegs d block_live | d <- dests ]
+    !joinOuts | cyclic    = []
+              | otherwise = into dests outs
+    -- the recorded assignment tested first, so that a block whose targets all
+    -- have one does not compute the joins: the joins tested first made the
+    -- compiler run 0.049% more instructions and allocate 0.050% more compiling
+    -- nofib's puzzle at -O2, 0.024% and 0.024% more at -O, and none at -O0, on
+    -- GHC 10.1.20261108
+    into (d : ds) (rs : rss)
+      | isNothing (lookupBlockAssignment d bassig), d `setMember` joins
+      = rs : into ds rss
+      | otherwise = into ds rss
+    into _ _ = []
+    go :: Int -> UniqFM VirtualReg Int -> [LiveInstr instr]
+       -> UniqFM VirtualReg Int
+    go !_ !m [] = m
+    go i m (LiveInstr _ (Just live) : is)
+      = go (i + 1) (foldl' (readAt i) m (getRU (liveUsage live))) is
+    go i m (_ : is) = go (i + 1) m is
+    getRU (RU rd _) = rd
+    readAt i m (RegWithFormat (RegVirtual v) _)
+      | liveOutOf (getUnique v) outs = addToUFM m v i
+    readAt _ m _ = m
+
+-- | Whether an instruction of the block after the given position reads the vreg
+-- with the given unique, a candidate for spilling there, from the block's last
+-- reads ('lastReadsIn'): one not live out of the block is read again before it
+-- dies, as it is live there.
+readLeft :: LastReads -> Int -> Unique -> Bool
+readLeft (LastReads lastReads outs _) !pos u = case lookupUFM_Directly lastReads u of
+  Just p  -> p > pos
+  Nothing -> not (liveOutOf u outs)
+
+-- | Whether the vreg with the given unique is a victim that will be in its slot
+-- on the way to a jump target anyway, where the block must spill at the given
+-- position, given the block's last reads ('lastReadsIn') and the assignments
+-- in rc_jumpLocs: no instruction of the block after the position reads it
+-- ('readLeft'), and one of those assignments holds it in its slot and none in a
+-- register, which it would have to be reloaded into on the way there.
+slotAhead :: LastReads -> [RegMap Loc] -> Int -> Unique -> Bool
+slotAhead lastReads locs !pos u = not (readLeft lastReads pos u) && go False locs
+  where
+    go !s [] = s
+    go s (assig : more) = case lookupUFM_Directly assig u of
+      Just (Loc (InMem _) _) -> go True more
+      Just _                 -> False
+      Nothing                -> go s more
+
+-- | Whether a vreg of the given class is live out of the block, from its last
+-- reads ('lastReadsIn'): where none is, every vreg of the class there is read
+-- again in the block ('readLeft').
+liveOutClass :: Arch -> LastReads -> RegClass -> Bool
+liveOutClass arch (LastReads _ outs _) cls
+  = any (classIn . ufmToIntMap . getUniqSet . getRegs) outs
+  where
+    -- a traversal of the set's map, stopping at the first vreg of the class:
+    -- uniqSetAny made the compiler allocate 0.033% more compiling !16269's
+    -- CmmDiamondChain at -O0 and 0.027% more at -O and -O2, the cause
+    -- unidentified, on GHC 10.1.20261108
+    classIn Nil = False
+    classIn (Tip _ (RegWithFormat (RegVirtual v) _))
+      = classOfVirtualReg arch v == cls
+    classIn (Tip _ _) = False
+    classIn (Bin _ _ l r) = classIn l || classIn r
+
+-- | Whether the vreg with the given unique is live into a jump target of the
+-- block with no recorded assignment that another block jumps to as well, where
+-- neither is in a cycle, given the block's last reads ('lastReadsIn').
+intoUnrecorded :: LastReads -> Unique -> Bool
+intoUnrecorded (LastReads _ _ joinOuts) u = liveOutOf u joinOuts
+
+-- | The blocks of a procedure in no cycle that more than one of its blocks
+-- jumps to, given the jump targets of each block and the procedure's SCCs.
+acyclicJoins :: BlockMap [BlockId] -> [SCC (LiveBasicBlock instr)] -> LabelSet
+acyclicJoins jsuccs sccs = jumpedToTwice (const True) jsuccs `setDifference` cyclic
+  where
+    cyclic = setFromList [ b | CyclicSCC bs <- sccs, BasicBlock b _ <- bs ]
+
+-- | Whether a unique is not among the given ones: 'notElem', but strict in the
+-- unique, so that its worker takes it unboxed: with notElem the compiler ran
+-- 0.10% more instructions compiling T3294 at -O0, 0.035% more at -O and 0.033%
+-- more at -O2, its allocation within 0.003%, on GHC 10.1.20261108.
+notKept :: Unique -> [Unique] -> Bool
+notKept !_ []       = True
+notKept u (k : ks) = k /= u && notKept u ks
+
+-- | The vreg of an assignment in the given register, with its location.
+occupant :: RealReg -> UniqFM VirtualReg Loc -> Maybe (Unique, Loc)
+occupant r assig
+  = find (\ (_, Loc l _) -> r `elem` regsOfLoc l) (nonDetUFMToList assig)
+
+-- | Whether the vreg with the given unique is live into one of the jump targets
+-- whose live registers are given: a loop strict in the unique, as 'notKept' is;
+-- with any, the compiler allocated 0.054% more compiling !16269's
+-- CmmDiamondChain at -O0 and 0.044% more at -O and -O2, on GHC 10.1.20261108.
+liveOutOf :: Unique -> [Regs] -> Bool
+liveOutOf !_ []         = False
+liveOutOf u (rs : rss) = elemUniqSet_Directly u (getRegs rs) || liveOutOf u rss
 
 -- | Calculate a new location after a register has been loaded.
 newLocation :: SpillLoc -> RealRegUsage -> Loc

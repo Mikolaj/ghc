@@ -41,6 +41,7 @@ ncgX86_64 config = NcgImpl
    , ncgMakeFarBranches        = \_p _i bs -> pure bs
    , extractUnwindPoints       = X86.extractUnwindPoints
    , invertCondBranches        = X86.invertCondBranches
+   , copyLoopHeads             = X86.copyLoopHeads
    }
     where
       platform = ncgPlatform config
@@ -59,6 +60,7 @@ instance Instruction X86.Instr where
    isMetaInstr             = X86.isMetaInstr
    mkRegRegMoveInstr       = X86.mkRegRegMoveInstr
    takeRegRegMoveInstr     = X86.takeRegRegMoveInstr
+   mkRegRegSwapInstr       = X86.mkRegRegSwapInstr
    mkJumpInstr             = X86.mkJumpInstr
    mkStackAllocInstr       = X86.mkStackAllocInstr
    mkStackDeallocInstr     = X86.mkStackDeallocInstr

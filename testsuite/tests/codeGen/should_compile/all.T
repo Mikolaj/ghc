@@ -173,3 +173,55 @@ test('T20298c', normal, compile, ['-O2 -dno-builtin-rules -ddump-simpl -dno-type
 
 test('T27368', normal, compile, ['-O'])
 test('T27979', [req_cmm, check_errmsg('stg_ap_0_fast')], compile, ['-O -ddump-cmm -dno-typeable-binds -dsuppress-uniques'])
+
+# Return addresses stored below Sp, which stack layout no longer emits
+# in these loops (x86-64 assembly)
+test('StackLayoutTagLoop', [only_ways(['optasm']), unless(arch('x86_64'), skip),
+                            grep_errmsg(r'(movq \$\.L\w+_info,-\d+\(%rbp\))', [1])],
+     compile, ['-ddump-asm'])
+test('StackLayoutCallLoop', [only_ways(['optasm']), unless(arch('x86_64'), skip),
+                             grep_errmsg(r'(movq \$\.L\w+_info,-\d+\(%rbp\))', [1])],
+     compile, ['-ddump-asm'])
+
+# Stores of a self-recursive loop's stack arguments, which stack layout
+# no longer emits at the loop's iterations (x86-64 assembly)
+test('T27991', [only_ways(['optasm']), unless(arch('x86_64'), skip),
+                grep_errmsg(r'(movq %\w+,-?\d*\(%rbp\))', [1])],
+     compile, ['-ddump-asm'])
+
+# Fields loaded where a case alternative starts and used only after a call,
+# their constructor saved across it anyway (#20334) or, where all of them are
+# live across the call and it is not, saved in their place: loaded from it
+# again after the call, so the only Doubles stored on the stack are V's, by its
+# constructor function's entry to the GC (x86-64 assembly)
+test('T20334', [only_ways(['optasm']), unless(arch('x86_64'), skip),
+                grep_errmsg(r'(movsd %xmm\d+,-?\d+\(%rbp\))', [1])],
+     compile, ['-ddump-asm'])
+
+# A function closure's free variables, loaded where its code starts and used
+# only after an evaluation or a call that all of them are live across and
+# the closure is not, the closure saved in their place (#20333): loaded from
+# it again after the evaluation or the call, so the only Doubles stored on
+# the stack are foo's and bar's arguments, by their entry to the GC (x86-64
+# assembly)
+test('T20333', [only_ways(['optasm']), unless(arch('x86_64'), skip),
+                grep_errmsg(r'(movsd %xmm\d+,-?\d+\(%rbp\))', [1])],
+     compile, ['-ddump-asm'])
+
+# A function closure's free variables, used in both arms of a branch before
+# a call and again after it: the closure saved in their place across the call,
+# so that on each path its entry stores the closure alone below Sp (#20333;
+# x86-64 assembly, the offsets of the stores below Sp)
+test('T20333b',
+     [only_ways(['optasm']), unless(arch('x86_64'), skip),
+      grep_errmsg(r'(-\d+\(%rbp\))$', [1])],
+     compile, ['-ddump-asm'])
+
+# A case alternative's four fields, three of them used by a loop before a call
+# and all of them after it: the constructor saved in their place across the
+# loop and the call (#20333; x86-64 assembly, the offsets of the stores below
+# Sp)
+test('T20333c',
+     [only_ways(['optasm']), unless(arch('x86_64'), skip),
+      grep_errmsg(r'(-\d+\(%rbp\))$', [1])],
+     compile, ['-ddump-asm'])

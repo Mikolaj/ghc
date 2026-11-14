@@ -1,6 +1,7 @@
 module GHC.CmmToAsm.Reg.Linear.FreeRegs (
     FR(..),
     allFreeRegs,
+    allocateRealRegs,
     maxSpillSlots
 )
 where
@@ -14,6 +15,9 @@ import qualified GHC.Platform.Reg.Class.Separate  as Separate
 import qualified GHC.Platform.Reg.Class.NoVectors as NoVectors
 
 import GHC.CmmToAsm.Config
+import GHC.CmmToAsm.Format (RegWithFormat (..))
+import GHC.CmmToAsm.Reg.Regs (Regs (..))
+import GHC.Types.Unique.Set (nonDetStrictFoldUniqSet)
 import GHC.Utils.Panic
 import GHC.Platform
 
@@ -23,11 +27,13 @@ import GHC.Platform
 -- Here's an inefficient 'executable specification' of the FreeRegs data type:
 --
 --      type FreeRegs = [RegNo]
---      noFreeRegs = 0
+--      noFreeRegs = []
 --      releaseReg n f = if n `elem` f then f else (n : f)
 --      initFreeRegs = allocatableRegs
---      getFreeRegs cls f = filter ( (==cls) . regClass . RealReg ) f
+--      getFreeRegs cls f = filter ( (==cls) . regClass . RealReg ) (inOrder f)
 --      allocateReg f r = filter (/= r) f
+--
+--      where inOrder puts them in a fixed order of each instance's own.
 
 import qualified GHC.CmmToAsm.Reg.Linear.PPC     as PPC
 import qualified GHC.CmmToAsm.Reg.Linear.X86     as X86
@@ -102,6 +108,18 @@ allFreeRegs plat fr = foldMap (\rcls -> frGetFreeRegs rcls fr) allRegClasses
         Unified   ->   Unified.allRegClasses
         Separate  ->  Separate.allRegClasses
         NoVectors -> NoVectors.allRegClasses
+
+-- | Mark the real registers among the given ones allocated, such as those
+-- live into a block.
+allocateRealRegs :: FR freeRegs => Regs -> freeRegs -> freeRegs
+{-# INLINABLE allocateRealRegs #-}
+allocateRealRegs regs fr
+  = nonDetStrictFoldUniqSet alloc fr (getRegs regs)
+    -- See Note [Unique Determinism and code generation]
+  where
+    alloc r acc = case regWithFormat_reg r of
+      RegReal rr -> frAllocateReg rr acc
+      _          -> acc
 
 maxSpillSlots :: NCGConfig -> Int
 maxSpillSlots config = case platformArch (ncgPlatform config) of

@@ -12,7 +12,8 @@ import GHC.Prelude
 
 import GHC.CmmToAsm.Reg.Linear.State
 import GHC.CmmToAsm.Reg.Linear.Base
-import GHC.CmmToAsm.Reg.Linear.FreeRegs
+import GHC.CmmToAsm.Reg.Linear.FreeRegs (FR (..))
+import GHC.CmmToAsm.Reg.Target (targetClassOfReg, targetMkVirtualReg)
 import GHC.CmmToAsm.Reg.Liveness
 import GHC.CmmToAsm.Instr
 import GHC.CmmToAsm.Types
@@ -33,6 +34,7 @@ import GHC.CmmToAsm.Format
 import GHC.Types.Unique.Set
 
 import Data.Coerce (coerce)
+import Data.Functor.Classes (liftEq)
 
 -- | For a jump instruction at the end of a block, generate fixup code so its
 --      vregs are in the correct regs for its destination.
@@ -94,54 +96,22 @@ joinToTargets' block_live new_blocks block_id instr (dest:dests)
         let still_live uniq _   = uniq `elemUniqSet_Directly` getRegs live_set
         let adjusted_assig      = filterUFM_Directly still_live assig
 
-        -- and free up those registers which are now free.
-        let to_free =
-                [ r     | (reg, Loc loc _locFmt) <- nonDetUFMToList assig
-                        -- This is non-deterministic but we do not
-                        -- currently support deterministic code-generation.
-                        -- See Note [Unique Determinism and code generation]
-                        , not (elemUniqSet_Directly reg $ getRegs live_set)
-                        , r          <- regsOfLoc loc ]
-
         case lookupBlockAssignment  dest block_assig of
+         -- this is the first time we jumped to this block: remember the
+         -- current assignment on entry to it
          Nothing
-          -> joinToTargets_first
-                        block_live new_blocks block_id instr dest dests
-                        block_assig adjusted_assig to_free
+          -> do setBlockAssigR
+                  (updateBlockAssignment dest adjusted_assig block_assig)
+                joinToTargets' block_live new_blocks block_id instr dests
 
-         Just (_, dest_assig)
+         Just dest_assig
           -> joinToTargets_again
                         block_live new_blocks block_id instr dest dests
                         adjusted_assig dest_assig
 
 
--- this is the first time we jumped to this block.
-joinToTargets_first :: (FR freeRegs, Instruction instr)
-                    => BlockMap Regs
-                    -> [NatBasicBlock instr]
-                    -> BlockId
-                    -> instr
-                    -> BlockId
-                    -> [BlockId]
-                    -> BlockAssignment freeRegs
-                    -> RegMap Loc
-                    -> [RealReg]
-                    -> RegM freeRegs ([NatBasicBlock instr], instr)
-joinToTargets_first block_live new_blocks block_id instr dest dests
-        block_assig src_assig
-        to_free
-
- = do   -- free up the regs that are not live on entry to this block.
-        freeregs        <- getFreeRegsR
-        let freeregs' = foldl' (flip frReleaseReg) freeregs to_free
-
-        -- remember the current assignment on entry to this block.
-        setBlockAssigR (updateBlockAssignment dest (freeregs', src_assig) block_assig)
-
-        joinToTargets' block_live new_blocks block_id instr dests
-
 -- we've jumped to this block before
-joinToTargets_again :: (Instruction instr, FR freeRegs)
+joinToTargets_again :: (FR freeRegs, Instruction instr)
                     => BlockMap Regs
                     -> [NatBasicBlock instr]
                     -> BlockId
@@ -156,12 +126,7 @@ joinToTargets_again
     src_assig dest_assig
 
         -- the assignments already match, no problem.
-        | equalIgnoringFormats
-            (nonDetUFMToList dest_assig)
-            (nonDetUFMToList src_assig)
-        -- This is non-deterministic but we do not
-        -- currently support deterministic code-generation.
-        -- See Note [Unique Determinism and code generation]
+        | equalIgnoringFormats dest_assig src_assig
         = joinToTargets' block_live new_blocks block_id instr dests
 
         -- assignments don't match, need fixup code
@@ -198,7 +163,7 @@ joinToTargets_again
                         (return ())
                 -}
                 delta           <- getDeltaR
-                fixUpInstrs     <- concatMapM (handleComponent delta instr) sccs
+                fixUpInstrs     <- concatMapM (handleComponent delta instr dest_assig) sccs
 
                 -- make a new basic block containing the fixup code.
                 --      A the end of the current block we will jump to the fixup one,
@@ -237,17 +202,15 @@ joinToTargets_again
 
 -- | Construct a graph of register\/spill movements.
 --
---      Cyclic components seem to occur only very rarely.
---
---      We cut some corners by not handling memory-to-memory moves.
---      This shouldn't happen because every temporary gets its own stack slot.
+--      A move from memory to memory is made through a register (makeMove).
 --
 makeRegMovementGraph :: RegMap Loc -> RegMap Loc -> [Node Loc Unique]
 makeRegMovementGraph adjusted_assig dest_assig
  = [ node       | (vreg, src) <- nonDetUFMToList adjusted_assig
-                    -- This is non-deterministic but we do not
-                    -- currently support deterministic code-generation.
-                    -- See Note [Unique Determinism and code generation]
+                    -- The list's order decides the order of the fixup moves and
+                    -- which move of a cycle is made first: see
+                    -- Note [Unique order in the linear allocator] in
+                    -- GHC.CmmToAsm.Reg.Linear
                     -- source reg might not be needed at the dest:
                 , Just loc <- [lookupUFM_Directly dest_assig vreg]
                 , node <- expandNode vreg src loc ]
@@ -269,6 +232,16 @@ expandNode
         -> Loc -- ^ source of move
         -> Loc -- ^ destination of move
         -> [Node Loc a]
+-- a destination slot that is the source's holds the value already: only the
+-- destination's register, if any, is written
+expandNode vreg src@(Loc srcLoc _) (Loc dstLoc dstFmt)
+        | Just m <- slotOf srcLoc, InMem dstMem <- dstLoc, dstMem == m
+        = []
+        | Just m <- slotOf srcLoc, InBoth dstReg dstMem <- dstLoc, dstMem == m
+        = expandNode vreg src (Loc (InReg dstReg) dstFmt)
+        where slotOf (InMem s)    = Just s
+              slotOf (InBoth _ s) = Just s
+              slotOf (InReg _)    = Nothing
 expandNode vreg src@(Loc srcLoc srcFmt) dst@(Loc dstLoc dstFmt) =
   case (srcLoc, dstLoc) of
     (InReg srcReg, InBoth dstReg dstMem)
@@ -277,15 +250,9 @@ expandNode vreg src@(Loc srcLoc srcFmt) dst@(Loc dstLoc dstFmt) =
         | otherwise
         -> [DigraphNode vreg src [Loc (InReg dstReg) dstFmt
                                  ,Loc (InMem dstMem) dstFmt]]
-    (InMem srcMem, InBoth dstReg dstMem)
-        | srcMem == dstMem
-        -> [DigraphNode vreg src [Loc (InReg dstReg) dstFmt]]
-        | otherwise
+    (InMem _, InBoth dstReg dstMem)
         -> [DigraphNode vreg src [Loc (InReg dstReg) dstFmt
                                  ,Loc (InMem dstMem) dstFmt]]
-    (InBoth _ srcMem, InMem dstMem)
-        | srcMem == dstMem
-        -> [] -- guaranteed to be true
     (InBoth srcReg _, InReg dstReg)
         | srcReg == dstReg
         -> []
@@ -304,16 +271,16 @@ expandNode vreg src@(Loc srcLoc srcFmt) dst@(Loc dstLoc dstFmt) =
 --      cycles in expandNode above.
 --
 handleComponent
-        :: Instruction instr
-        => Int -> instr -> SCC (Node Loc Unique)
+        :: (FR freeRegs, Instruction instr)
+        => Int -> instr -> RegMap Loc -> SCC (Node Loc Unique)
         -> RegM freeRegs [instr]
 
 -- If the graph is acyclic then we won't get the swapping problem below.
 --      In this case we can just do the moves directly, and avoid having to
 --      go via a spill slot.
 --
-handleComponent delta _  (AcyclicSCC (DigraphNode vreg src dsts))
-        = concatMapM (makeMove delta vreg src) dsts
+handleComponent delta _ dest_assig (AcyclicSCC (DigraphNode vreg src dsts))
+        = concatMapM (makeMove delta dest_assig vreg src) dsts
 
 
 -- Handle some cyclic moves.
@@ -323,18 +290,42 @@ handleComponent delta _  (AcyclicSCC (DigraphNode vreg src dsts))
 --          (vreg1, InReg r1,    [InReg r2])
 --          (vreg2, InReg r2,    [InReg r1])
 --
---      To avoid needing temp register, we just spill all the source regs, then
---      reaload them into their destination regs.
+--      Where one instruction swaps two registers of the format, we swap the
+--      first source with its destination: the value the destination held,
+--      the source of another move of the cycle, is then in the source
+--      register, so the remaining moves are a cycle one shorter, until
+--      the last swap places two values.  Otherwise, to avoid needing a temp
+--      register, we spill the first source, do the other moves, then reload
+--      it into its destination.
 --
 --      Note that we can not have cycles that involve memory locations as
 --      sources as single destination because memory locations (stack slots)
 --      are allocated exclusively for a virtual register and therefore can not
---      require a fixup.
+--      require a fixup. A virtual register does get a new slot where its format
+--      outgrows the old one (getStackSlotFor, #26668), but no other move
+--      writes the slot it is moved from, so its move between the two slots
+--      is in no cycle.
 --
-handleComponent delta instr
-        (CyclicSCC ((DigraphNode vreg (Loc (InReg sreg) scls) ((Loc (InReg dreg) dcls: _))) : rest))
+handleComponent delta instr dest_assig
+        (CyclicSCC ((DigraphNode vreg src@(Loc (InReg sreg) scls) ((Loc (InReg dreg) dcls: more))) : rest))
         -- dest list may have more than one element, if the reg is also InMem.
  = do
+    config <- getConfig
+    case mkRegRegSwapInstr config scls (RegReal sreg) (RegReal dreg) of
+      Just swap -> do
+        stores <- concatMapM (makeMove delta dest_assig vreg src) more
+        recordSpill (SpillJoinRR vreg)
+        -- the value dreg held is now in sreg, so it needs no move into sreg
+        let moved (DigraphNode v (Loc (InReg r) fmt) ds)
+              | r == dreg = DigraphNode v (Loc (InReg sreg) fmt)
+                                        (filter (not . inSreg) ds)
+            moved n = n
+            inSreg (Loc (InReg r) _) = r == sreg
+            inSreg _                 = False
+        remainingFixUps <- mapM (handleComponent delta instr dest_assig)
+                                (movementGraphSCCs (map moved rest))
+        return (stores ++ swap : concat remainingFixUps)
+      Nothing -> do
         -- spill the source into its slot
         (instrSpill, slot)
                         <- spillR (RegWithFormat (RegReal sreg) scls) vreg
@@ -342,21 +333,24 @@ handleComponent delta instr
         -- reload into destination reg
         instrLoad       <- loadR (RegWithFormat (RegReal dreg) dcls) slot
 
-        remainingFixUps <- mapM (handleComponent delta instr)
+        remainingFixUps <- mapM (handleComponent delta instr dest_assig)
                                 (movementGraphSCCs rest)
 
         -- make sure to do all the reloads after all the spills,
         --      so we don't end up clobbering the source values.
         return (instrSpill ++ concat remainingFixUps ++ instrLoad)
 
-handleComponent _ _ (CyclicSCC _)
+handleComponent _ _ _ (CyclicSCC _)
  = panic "Register Allocator: handleComponent cyclic"
 
--- Helper functions that use the @Ord (IgnoreFormat Loc)@ instance.
+-- | Whether the two assignments give every vreg the same location, whatever
+-- its formats.
+equalIgnoringFormats :: RegMap Loc -> RegMap Loc -> Bool
+equalIgnoringFormats a b
+  = liftEq (\(Loc l1 _) (Loc l2 _) -> l1 == l2) (ufmToIntMap a) (ufmToIntMap b)
 
-equalIgnoringFormats :: [(Unique, Loc)] -> [(Unique, Loc)] -> Bool
-equalIgnoringFormats =
-  coerce $ (==) @[(Unique, IgnoreFormat Loc)]
+-- A helper function that uses the @Ord (IgnoreFormat Loc)@ instance.
+
 movementGraphSCCs :: [Node Loc Unique] -> [SCC (Node Loc Unique)]
 movementGraphSCCs =
   coerce $ stronglyConnCompFromEdgedVerticesOrdR @(IgnoreFormat Loc) @Unique
@@ -364,14 +358,15 @@ movementGraphSCCs =
 -- | Move a vreg between these two locations.
 --
 makeMove
-    :: Instruction instr
+    :: (FR freeRegs, Instruction instr)
     => Int           -- ^ current C stack delta
+    -> RegMap Loc    -- ^ the destination's assignment
     -> Unique        -- ^ unique of the vreg that we're moving
     -> Loc -- ^ source location
     -> Loc -- ^ destination location
     -> RegM freeRegs [instr]  -- ^ move instruction
 
-makeMove delta vreg (Loc src _srcFmt) (Loc dst dstFmt)
+makeMove delta dest_assig vreg (Loc src srcFmt) (Loc dst dstFmt)
  = do config <- getConfig
       case (src, dst) of
           (InReg s, InReg d) ->
@@ -383,9 +378,36 @@ makeMove delta vreg (Loc src _srcFmt) (Loc dst dstFmt)
           (InReg s, InMem d) ->
               do recordSpill (SpillJoinRM vreg)
                  return $ mkSpillInstr config (RegWithFormat (RegReal s) dstFmt) delta d
+          -- A vreg that outgrows its slot gets a new one (getStackSlotFor,
+          -- #26668), so on two paths to a join it can be in memory only, in
+          -- two slots (#27638).  It is moved through a register that holds
+          -- nothing at the jump and is in no destination, at the narrower of
+          -- the two formats: no more is in the source slot or fits in the
+          -- destination slot.  At most 8 bytes can go through an integer
+          -- register.
+          (InMem s, InMem d) ->
+              do platform <- getPlatform
+                 free     <- getFreeRegsR
+                 let fmt | formatInBytes srcFmt <= formatInBytes dstFmt = srcFmt
+                         | otherwise                                    = dstFmt
+                     taken = [ r | Loc l _ <- nonDetEltsUFM dest_assig
+                                 , r <- regsOfLoc l ]
+                     spare f = [ (r, f)
+                               | r <- frGetFreeRegs (targetClassOfReg platform
+                                        (RegVirtual (targetMkVirtualReg platform vreg f)))
+                                        free
+                               , r `notElem` taken ]
+                     viaInt | formatInBytes fmt <= 8 = spare (intFormat (formatToWidth fmt))
+                            | otherwise              = []
+                 case spare fmt ++ viaInt of
+                   (r, f) : _ ->
+                     do recordSpill (SpillJoinRM vreg)
+                        recordSpill (SpillJoinRM vreg)
+                        return $ mkLoadInstr config (RegWithFormat (RegReal r) f) delta s
+                              ++ mkSpillInstr config (RegWithFormat (RegReal r) f) delta d
+                   [] -> pprPanic "makeMove: no free register for a mem->mem move"
+                           (ppr vreg <+> parens (ppr src) <+> parens (ppr dst))
           _ ->
-              -- we don't handle memory to memory moves.
-              -- they shouldn't happen because we don't share
-              -- stack slots between vregs.
-              pprPanic "makeMove: we don't handle mem->mem moves"
+              -- expandNode leaves no InBoth location
+              pprPanic "makeMove: InBoth"
                  (ppr vreg <+> parens (ppr src) <+> parens (ppr dst))

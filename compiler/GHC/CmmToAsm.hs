@@ -123,7 +123,7 @@ import GHC.Data.Stream (liftIO)
 import qualified GHC.Data.Stream as Stream
 import GHC.Settings
 
-import Data.List (sortBy)
+import Data.List (sortBy, mapAccumL)
 import Data.List.NonEmpty (groupAllWith, head)
 import Data.Maybe
 import Data.Ord         ( comparing )
@@ -491,6 +491,11 @@ cmmNativeGen logger ncgImpl us fileIds dbgMap cmm count
         -- tag instructions with register liveness information
         -- also drops dead code. We don't keep the cfg in sync on
         -- some backends, so don't use it there.
+        -- Where ncgEnableDeadCodeElimination is off, as under -finfo-table-map
+        -- (#20428), no CFG follows register allocation, so static prediction
+        -- for the layout and the chain layout of -fblock-layout-cfg are off
+        -- as well; the linear allocator's estimate, allocFreqs, is made all
+        -- the same.
         let livenessCfg = if ncgEnableDeadCodeElimination config
                                 then Just nativeCfgWeights
                                 else Nothing
@@ -501,6 +506,22 @@ cmmNativeGen logger ncgImpl us fileIds dbgMap cmm count
         let allocCold = if backendMaintainsCfg platform
                           then checkFailures nativeCfgWeights
                           else setEmpty
+        -- how often the linear allocator estimates each block to run, from
+        -- the procedure's first block, where the backend maintains the CFG and
+        -- static prediction is on (-fcmm-static-pred, at -O and -O2), and the
+        -- registers holding tags, which static prediction reads in both
+        -- estimates; bound strictly, so that at -O0 the pair is static and not
+        -- a thunk a procedure: bound lazily, allocFreqs alone made the compiler
+        -- allocate 0.060% more compiling T9961 at -O0, and 0.025% and 0.024%
+        -- more at -O and -O2, on GHC 10.1.20261107
+            !(allocFreqs, predTags) = case cmm of
+              CmmProc _ _ _ graph
+                | backendMaintainsCfg platform && ncgCmmStaticPred config
+                , let tags = tagRegisters graph
+                -> ( \entry -> blockFrequencies tags allocCold
+                                                entry nativeCfgWeights
+                   , tags )
+              _ -> (const noBlockFreqs, mempty)
         let (withLiveness, usLive) =
                 {-# SCC "regLiveness" #-}
                 runUniqueDSM usGen
@@ -578,7 +599,7 @@ cmmNativeGen logger ncgImpl us fileIds dbgMap cmm count
                 -- do linear register allocation
                 let reg_alloc proc = do
                        (alloced, maybe_more_stack, ra_stats) <-
-                               Linear.regAlloc config allocCold proc
+                               Linear.regAlloc config allocCold allocFreqs proc
                        case maybe_more_stack of
                          Nothing -> return ( alloced, ra_stats, [] )
                          Just amount -> do
@@ -638,9 +659,34 @@ cmmNativeGen logger ncgImpl us fileIds dbgMap cmm count
                 {-# SCC "shortcutBranches" #-}
                 shortcutBranches config ncgImpl tabled postRegCFG
 
-        let optimizedCFG :: Maybe CFG
-            optimizedCFG =
-                optimizeCFG (ncgCmmStaticPred config) weights cmm <$!> postShortCFG
+        let optimizedLoops
+              :: Maybe (CFG, [(BlockId, BlockId)], [(BlockId, BlockId)])
+            optimizedLoops =
+                optimizeCFG (ncgCmmStaticPred config) predTags weights cmm
+                  <$!> postShortCFG
+
+        ---- copy small loop heads over the jumps to them, where the chain
+        -- layout follows to place the copies' successors, and only in a
+        -- procedure with loops: run for every decl, the step made the compiler
+        -- allocate 0.11% more and run 0.067% more instructions compiling T9961
+        -- at -O, allocate 0.078% more compiling it at -O2 and run 0.067% more
+        -- compiling T3294 there, and nothing more at -O0, where the step does
+        -- not run, on GHC 10.1.20261108
+        let (copied, optimizedCFG)
+              | ncgCfgBlockLayout config
+              , backendMaintainsCfg platform
+              , CmmProc {} <- cmm
+              , Just (cfg0, backs, searchBacks) <- optimizedLoops
+              , notNull backs
+              = {-# SCC "copyLoopHeads" #-}
+                let copy cfg (CmmProc info lbl live (ListGraph blocks))
+                      | Just (blocks', cfg') <- copyLoopHeads ncgImpl cfg backs
+                                                    searchBacks info blocks
+                      = (cfg', CmmProc info lbl live (ListGraph blocks'))
+                    copy cfg top = (cfg, top)
+                    (cfg', tops) = mapAccumL copy cfg0 shorted
+                in (tops, Just $! cfg')
+              | otherwise = (shorted, (\(c, _, _) -> c) <$> optimizedLoops)
 
         maybeDumpCfg logger optimizedCFG "CFG Weights - Final" proc_name
 
@@ -650,7 +696,7 @@ cmmNativeGen logger ncgImpl us fileIds dbgMap cmm count
 
         when ( ncgEnableDeadCodeElimination config &&
                 (ncgAsmLinting config || debugIsOn )) $ do
-                let blocks = concatMap getBlks shorted
+                let blocks = concatMap getBlks copied
                 let labels = setFromList $ fmap blockId blocks :: LabelSet
                 let cfg = fromJust optimizedCFG
                 return $! seq (sanityCheckCfg cfg labels $
@@ -662,9 +708,9 @@ cmmNativeGen logger ncgImpl us fileIds dbgMap cmm count
                         {-# SCC "sequenceBlocks" #-}
                         runUniqueDSM usAlloc $ mapM (BlockLayout.sequenceTop
                                 ncgImpl optimizedCFG)
-                            shorted
+                            copied
 
-        massert (checkLayout shorted sequenced)
+        massert (checkLayout copied sequenced)
 
         let branchOpt :: [NatCmmDecl statics instr]
             branchOpt =

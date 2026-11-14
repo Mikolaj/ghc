@@ -36,7 +36,7 @@ import GHC.Utils.Misc
 
 import Data.List        (nub)
 import Data.Maybe
-import Control.Monad (join)
+import qualified Data.Set as Set
 
 
 -- | Records the expected cost to spill some register.
@@ -90,16 +90,20 @@ slurpSpillCostInfo platform cfg cmm
                 = mapM_ (countBlock info freqMap)
                 $ flattenSCCs sccs
             where
-                LiveInfo _ entries _ _ = info
-                freqMap = (fst . mkGlobalWeights (head entries)) <$> cfg
+                LiveInfo _ entries _ _ _ = info
+                -- the frequencies scale only the counts of uses and
+                -- definitions, on which no spill choice depends: chooseSpill
+                -- uses spillCost_length, a function of the lifetimes alone
+                freqMap = (\c -> blockFrequencies Set.empty (checkFailures c)
+                                                   (head entries) c) <$> cfg
 
         -- Lookup the regs that are live on entry to this block in
         --      the info table from the CmmProc.
         countBlock info freqMap (BasicBlock blockId instrs)
-                | LiveInfo _ _ blockLive _ <- info
+                | LiveInfo _ _ blockLive _ _ <- info
                 , Just rsLiveEntry  <- mapLookup blockId blockLive
                 , rsLiveEntry_virt  <- takeVirtualRegs $ getRegs rsLiveEntry
-                = countLIs (ceiling $ blockFreq freqMap blockId) rsLiveEntry_virt instrs
+                = countLIs (ceiling $ weightOf freqMap blockId) rsLiveEntry_virt instrs
 
                 | otherwise
                 = error "RegAlloc.SpillCost.slurpSpillCostInfo: bad block"
@@ -122,9 +126,9 @@ slurpSpillCostInfo platform cfg cmm
          = do
                 -- Increment the lifetime counts for regs live on entry to this instr.
                 mapM_ incLifetime $ nonDetEltsUniqSet rsLiveEntry
-                    -- This is non-deterministic but we do not
-                    -- currently support deterministic code-generation.
-                    -- See Note [Unique Determinism and code generation]
+                    -- Each vreg's lifetime is counted on
+                    -- its own, so the order does not matter
+                    -- (Note [Unique Determinism and code generation])
 
                 -- Increment counts for what regs were read/written from.
                 let (RU read written)   = liveUsage live
@@ -149,10 +153,10 @@ slurpSpillCostInfo platform cfg cmm
         incUses     count reg = modify $ \s -> addToUFM_C plusSpillCostRecord s reg (reg, 0, count, 0)
         incLifetime       reg = modify $ \s -> addToUFM_C plusSpillCostRecord s reg (reg, 0, 0, 1)
 
-        blockFreq :: Maybe (LabelMap Double) -> Label -> Double
-        blockFreq freqs bid
-          | Just freq <- join (mapLookup bid <$> freqs)
-          = max 1.0 (10000 * freq)
+        weightOf :: Maybe BlockFreqs -> Label -> Double
+        weightOf freqs bid
+          | Just fs <- freqs
+          = max 1.0 (10000 * blockFreq fs bid)
           | otherwise
           = 1.0 -- Only if no cfg given
 
